@@ -15,38 +15,37 @@
 | M6 | P6 | 板上跑 sgemm，与仿真结果比对 |
 | M7 | P7 | 张量单元加速比（可选） |
 
-## P0 — ISA 冻结 + 汇编器 lowering + 黄金模型
+## P0 — ISA 冻结 + 汇编器 + 黄金模型
 
-**目标**：在写 RTL 之前，先把指令集冻结，把结构化控制流 lowering 成 mask 序列的
-汇编器写出来，并有一个可执行的语义参考。
+**目标**：在写 RTL 之前，先把指令集冻结，写一个只做翻译的汇编器和一个可执行的语义
+参考，并用它们跑通手写的 mask 序列。
 
 **交付物**
 
-- 冻结 [design.md](design.md) §5 的编码：操作码表、谓词字段、mask 字段、立即数和
-  分支偏移宽度、保留编码、寄存器/谓词/mask 编号。
-- `sim/asm.py`：Python 汇编器。
-  - 解析结构化语法：`IF/ELSE/ENDIF`、`LOOP`、`break/continue`、标签。
-  - 控制流 lowering：按 [design.md](design.md) §6 的模板生成 mask 序列；
-    处理 `break/continue` 修改 continuation mask 的数据流。
-  - 保存 mask 的 GPR 分配：优先用简单栈式分配，后续再做复用优化；GPR 不够时给出
-    警告并标记溢出到 shared（具体策略留到软件阶段）。
-  - 静态检查：`BAR` 区域的 mask 必须是完整 mask；`break/continue` 的支持范围由
-    汇编器定义（v0.1 先支持最内层循环）；不允许跳进/跳出结构化区域；mask GPR
-    压力过高时给出警告并走溢出路径。
-  - 输出：IMEM 镜像 + 带 mask 注释的 listing（每个标签处的 mask 状态）。
-- `sim/golden/simt_golden.py`：黄金模型。per-lane 寄存器/谓词、执行 mask `M`、
+- 冻结 [design.md](design.md) §5 的编码：操作码表、`pred`/`func` 字段、立即数和
+  分支偏移宽度、保留编码、寄存器/谓词/mask 编号、`STATUS` 错误码。`sim/src/isa.rs`
+  是编码的唯一来源，汇编器和黄金模型都从它取定义。
+- `sim/src/asm.rs`：Rust 汇编器，编译成 `skein-asm`。
+  - 只做翻译：一行一条指令（认标签、去注释、编码成 32 位字），唯一的伪指令是
+    `LI rd, imm`（展开成 1–3 条 `ADDI`/`LUI`/`LUM`/`ORI`）。
+  - 控制流和掩码序列由 kernel 手写，模板见 [design.md](design.md) §6。
+  - 不做编译检查：跨区域跳转、`BAR` 的 mask、掩码寄存器压力都不管
+    （`BAR` 由硬件在运行时兜底）。
+  - 输出：IMEM 二进制镜像（每字 32 位小端）。
+- `sim/src/golden.rs`：黄金模型（`skein-run`）。per-lane 寄存器/谓词、执行 mask `M`、
   保存 mask 的 GPR、统一分支、mask 指令、两个地址空间和错误码；支持 `--trace` 和
-  `--dump-state`（dump 里包含 `M` 和汇编器列出的 mask GPR）。
-- `sim/tests/`：
-  - 定向 ISA 测试：每条指令至少一条。
-  - lowering 测试：结构化源码 → 汇编器输出的 mask 序列 → 黄金模型执行 →
-    与预期状态比对。
-  - 负例测试：非法的 `break/continue`、`BAR` 在收窄区域、mask GPR 压力告警、
-    跳进/跳出区域。
+  `--dump-state`（dump 里包含 `M` 和全部 GPR）。
+- `sim/tests/`：`cargo test` 跑的集成测试。
+  - 定向 ISA 测试：每条指令至少一条，含错误码。
+  - kernel 测试：手写的 mask 序列（`IF/ELSE` merge、循环收窄、continue、按 lane 的
+    break）和 `kernels/vecadd.s`，在黄金模型里逐 lane 比对。
 - 定稿 `SK_config.vh` 参数。
 
-**验收**：vecadd 在黄金模型里算出正确结果；lowering 测试全部通过；非法程序全部
-被汇编器拒绝。
+**验收**：vecadd 在黄金模型里算出正确结果；kernel 测试全部通过；非法的指令和操作数
+被汇编器拒绝（控制流正确性靠模板、测试和代码审查）。
+
+**状态**：已完成（`make test` 跑 26 条 Rust 测试：21 条 ISA + 5 条 kernel；
+`make asm` 出 `.bin`，`make sim` 用黄金模型跑）。
 
 ## P1 — 单 lane 最小核
 
@@ -58,6 +57,7 @@
 - `rtl/core/`：`SK_fetch.sv`、`SK_decode.sv`、`SK_regfile.sv`（LUTRAM，2 读 1 写）、
   `SK_alu.sv`、`SK_lsu.sv`、`SK_branch.sv`（统一分支）、`SK_mask.sv`（1 位 mask 版本）、
   `SK_commit.sv`；`rtl/top/SK_core.sv`。
+- `rtl/mem/SK_imem.sv`：BRAM 指令存储，PC 取指；主机装载口到 P6 再接。
 - `tb/tb_core.cpp`：Verilator testbench + IMEM/shared/global 内存模型 + 黄金模型
   dump 比对。
 - 跑通 `sum = 0; for (i = 0; i < 10; i++) sum += i;`，得到 45。
@@ -92,30 +92,30 @@
 - `rtl/sched/SK_scoreboard.sv`：跟踪 `LDG` 的目标寄存器（4–8 个 slot）。
 - `SK_lsu.sv` 改为非阻塞：`LDG` 发出后 warp 让出流水线；`STG` posted write +
   outstanding 计数，内核结束前必须排空。
-- `SK_bar_unit.sv`：块内屏障（只在完整 mask 下执行，汇编器负责检查）。
+- `rtl/sched/SK_bar_unit.sv`：块内屏障（只在完整 mask 下执行，汇编器负责检查）。
 - 性能计数器：每 warp 指令数、stall 周期数、mask 指令数。
 
 **验收**：4 warp 并发跑 vecadd 结果正确；IPC > 0.5（单 warp 时应当 < 0.3）。
 
 ## P4 — mask 控制流单元
 
-**目标**：把汇编器 lowering 出来的 mask 序列真正跑起来，验证结构化控制流、
-部分 lane 退出循环和 `break/continue`。
+**目标**：把 §6 的手写 mask 序列真正跑起来，验证分支、部分 lane 退出循环和
+`break/continue`。
 
 **交付物**
 
-- `rtl/simt/SK_mask.sv`：`M`（N 位）+ GPR 操作数的 mask 指令
+- `rtl/core/SK_mask.sv`：`M`（N 位）+ GPR 操作数的 mask 指令
   （`MSAVE/MREST/MMOV/MAND/MANDN/MOR/MNOT/MAND.P/MANDN.P/MOR.P`）；
   `.P` 结果硬件强制与 `M` 相干。
-- 统一分支：`BR.Z/BR.NZ` 在译码级解析（GPR 里的 mask 值已知），`JMP` 无条件跳转。
-- 汇编器 lowering 集成：结构化测试程序直接生成可上板的 IMEM 镜像。
+- 统一分支：`BRZ/BRNZ` 在译码级解析（GPR 里的 mask 值已知），`JMP` 无条件跳转。
+- kernel 集成：`kernels/` 里的手写 mask 程序直接生成可上板的 IMEM 镜像。
 - 测试：
   - `IF/ELSE`、嵌套 `IF/ELSE`、无 `ELSE` 的 `IF`。
   - `LOOP`：部分 lane 在不同迭代退出；所有 lane 同一轮退出。
   - `break/continue`：最内层循环、嵌在 `IF/ELSE` 里的 `break/continue`；
     终止型语句改变 continuation mask 的数据流。
-  - 静态检查：`BAR` 在收窄 mask 区域（应报错）、跨层 `break/continue`
-    （v0.1 汇编器报"不支持"）、mask GPR 压力告警/溢出路径（如果实现）。
+  - 汇编器静态检查（可选，见 P0 状态）：`BAR` 在收窄 mask 区域、跨层 `break/continue`、
+    mask GPR 压力告警。
   - 不变式：每个 `ENDIF`/循环出口后，`M` 恢复到预期值；没有 lane 被永久丢失。
 
 **验收**：结构化控制流测试与黄金模型逐 lane 状态一致；所有非法程序被汇编器拒绝；
@@ -143,6 +143,8 @@ mask 指令计数和理论值一致（汇编器的开销可见、可统计）。
 **交付物**
 
 - `rtl/top/SK_afu.v`：Vitis RTL kernel 壳（AXI-Lite 控制 + AXI4 主 + `ap_ctrl`）。
+- `rtl/top/SK_top.sv`、`rtl/top/SK_ctrl.sv`：核与主机接口的集成（AXI-Lite 参数、
+  IMEM 装载口、start/done/error）。
 - `syn/u250/`：`v++` 打包脚本（kernel → `.xo` → `.xclbin`）。
 - `sw/runtime/`：XRT 原生 API 主机程序，负责装载 IMEM、写参数、轮询 done/error。
 - `sw/tests/`：vecadd → sgemm 逐个上板验证。
@@ -172,7 +174,7 @@ mask 指令计数和理论值一致（汇编器的开销可见、可统计）。
 
 | 层 | 工具 | 速度 | 用途 |
 |---|---|---|---|
-| 黄金模型 | `sim/golden/simt_golden.py` | 毫秒 | 语义正确性的唯一裁判 |
+| 黄金模型 | `sim/src/golden.rs` | 毫秒 | 语义正确性的唯一裁判 |
 | RTL 仿真 | Verilator + `tb/` | 秒～分钟 | 每次改动后的回归 |
 | 上板 | Vivado + XRT | 小时 | 真实硬件与真实频率 |
 
@@ -180,34 +182,30 @@ mask 指令计数和理论值一致（汇编器的开销可见、可统计）。
 
 ### 黄金模型
 
-- 纯 Python，无依赖，可断点调试。
+- Rust，黄金模型本身只用标准库（命令行解析用 clap），可断点调试。
 - 状态包括：每 lane 的 GPR、谓词、PC、执行 mask `M`、保存 mask 的 GPR、
   shared/global 内存和错误码。
 - `--trace` 输出每条指令的执行轨迹；`--dump-state` 输出结束时的完整状态，
   供 RTL testbench 逐行 diff。
 - ISA 有歧义时以黄金模型为准，然后同步更新 [design.md](design.md)。
 
-### 汇编器 lowering 测试
+### mask 序列 / kernel 测试
 
-这是这套方案新增的验证层，也是分歧正确性的主要抓手：
+分歧的正确性主要落在手写的 mask 序列上：
 
-- **正向测试**：结构化源码 → 汇编器 → mask 序列 → 黄金模型执行 → 与预期状态比对。
-  覆盖 `IF/ELSE`、嵌套、`LOOP`、部分 lane 退出、`break/continue`。
-- **序列检查**：对每个结构化模板，检查生成的 mask 指令数量、保存 mask 的 GPR 使用
-  是否符合预期；优化（空路径跳过、if-conversion）后重新跑一遍。
-- **负例测试**：`BAR` 在收窄 mask 区域、跨层 `break/continue`（v0.1 汇编器报
-  "不支持"）、mask GPR 压力告警、
-  跳进/跳出结构化区域——全部必须报编译错误。
-- **不变式检查**：在每个 merge 点检查 `M` 是否恢复到预期集合；没有 lane 被永久
-  丢失或在 merge 后被意外激活。
+- **kernel 测试**：手写 mask 序列 → 黄金模型执行 → 与预期逐 lane 比对。覆盖
+  `IF/ELSE` 的 merge、循环收窄、`continue`、按 lane 的 `break`、以及 vecadd。
+- **模板对照**：kernel 里的序列要和 [design.md](design.md) §6 的模板一致；改模板就
+  同步改 kernel 和测试。
+- **不变式检查**：在每个 merge 点检查 `M` 是否恢复到预期集合；没有 lane 被永久丢失
+  或在 merge 后被意外激活。
 
 ### RTL 仿真
 
 - Lint：每次改完 RTL 先跑，抓 latch、位宽不匹配、多驱动。
 - 单元测试：模块级，例如仲裁器、FIFO、mask 单元（小 lane 数可以穷举 mask 组合）。
 - 定向测试：每条指令一个程序，覆盖边界值（0、-1、最大值、移位量等于位宽）。
-- 随机测试：随机但结构合法的指令流（生成器和汇编器共用同一套 lowering/mask
-  分配规则），两边比对完整状态。
+- 随机测试：随机但合法的指令流（生成器和黄金模型共用编码定义），两边比对完整状态。
 - Kernel 测试：vecadd / reduce / sgemm 端到端。
 
 ### 自动比对
@@ -226,7 +224,7 @@ mask 指令计数和理论值一致（汇编器的开销可见、可统计）。
 ### 回归
 
 ```bash
-make regress          # lint + 全部定向测试 + lowering 测试 + kernel 测试
+make regress          # lint + 全部测试
 ```
 
 每次阶段验收跑一次完整回归。失败的测试留在仓库里，改到变绿为止，不要注释掉。

@@ -1,0 +1,19 @@
+[package]
+name = "skein"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"   # clap 4.6 的最低版本
+description = "Skein SIMT 处理器的汇编器和黄金模型"
+publish = false
+
+[[bin]]
+name = "skein-asm"
+path = "src/bin/skein-asm.rs"
+
+[[bin]]
+name = "skein-run"
+path = "src/bin/skein-run.rs"
+
+[dependencies]
+# 只用在两个命令行工具的参数解析上；黄金模型本身不依赖它
+clap = { version = "4", features = ["derive"] }

@@ -1,0 +1,15 @@
+# 构建产物
+build/
+obj_dir/
+*.o
+*.xo
+*.xclbin
+*.jou
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Rust
+sim/target/

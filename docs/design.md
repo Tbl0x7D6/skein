@@ -15,7 +15,7 @@
 
 ## 2. 顶层参数
 
-RTL 宏集中在一个 `SK_config.vh`：
+RTL 宏集中在 [SK_config.vh](../rtl/SK_config.vh)：
 
 ```systemverilog
 `define SK_XLEN        32      // 数据宽度
@@ -28,9 +28,12 @@ RTL 宏集中在一个 `SK_config.vh`：
 `define SK_MEM_ADDR_W   32     // global 地址宽度
 ```
 
-执行 mask `M` 是硬件寄存器（N 位），通过 `MSAVE/MREST` 与通用寄存器交换。保存的
-mask 值放在 GPR 里，由汇编器分配和复用；GPR 不够时汇编器给出警告并溢出到 shared
-memory（具体策略留到写软件/汇编器时实现）。
+执行 mask `M` 是硬件寄存器（N 位），通过 `MSAVE/MREST` 与通用寄存器交换；`M` 的
+写入者还有 `MCLR.P`（见 §5.4）。保存的 mask 值放在 GPR 里，由 kernel 自己分配和
+复用（约定用 r24–r31，见 §6.5）；不够时得自己溢出到 shared memory，策略留到写软件
+阶段再说。
+
+`sim/src/isa.rs` 里的常量与这份参数保持一致。
 
 ## 3. 结构
 
@@ -81,17 +84,17 @@ memory（具体策略留到写软件/汇编器时实现）。
 - **warp 的生成与结束**：硬件按 `BLOCK_DIM`/`NWARP` 生成 warp，每条 warp 从入口
   `0x0000` 开始执行；`EXIT` 是 warp 级指令，执行到就结束整条 warp；所有 warp 结束后
   硬件置 done。
-- **汇编器的职责**：把结构化控制流（`IF/ELSE/ENDIF`、`LOOP`、`break/continue`）
-  lowering 成 mask 指令序列，做保存 mask 的 GPR 分配和静态检查。这是 P0 的核心交付物，
-  也是这套方案里最"像编译器"的部分。
+- **汇编器的职责**：只做翻译——一行一条指令，认标签，编码成 32 位字。掩码序列
+  （`MSAVE`/`MREST`/`MAND.P`/`MCLR.P`）是普通指令，由 kernel 手写；写法模板见 §6，
+  完整例子见 [sim/kernels/vecadd.s](../sim/kernels/vecadd.s)。
 
 ## 5. 指令集
 
 ### 5.1 设计原则
 
 - 32 位定长指令，6 位主操作码，PC 每步 +4。定长让取指、分支偏移和译码都很简单。
-- 不兼容任何现成 ISA，也不考虑高级编译器：kernel 用手写汇编写，汇编器负责结构化
-  控制流 lowering、mask 分配和编码。
+- 不兼容任何现成 ISA，也不考虑高级编译器：kernel 用手写汇编写，分歧用 mask 序列
+  表达；汇编器只负责编码。
 - 指令可以带谓词（`@p`）：谓词为假的 lane 不写回、不访存。
 - 控制流统一：没有 per-lane 分支，分支只测试 GPR 里的 mask 值（零/非零）或无条件跳转。
 - 指令集不提供 warp 级归约指令；需要归约时用 shared memory + `BAR` 自己搭。
@@ -110,21 +113,45 @@ memory（具体策略留到写软件/汇编器时实现）。
 
 ### 5.3 编码格式
 
-具体位分配在 P0 冻结；下面是格式框架，立即数和分支偏移都以指令字为单位、PC 相对。
+P0 冻结。位序从低位写起，立即数和分支/跳转偏移都以**指令字**为单位：
 
-| 格式 | 布局 | 用途 |
+| 格式 | 位分配 | 用途 |
 |---|---|---|
-| R | `op(6) rd(5) ra(5) rb(5) pred(4) func(7)` | 寄存器-寄存器 ALU / 比较 / 选择 |
-| RI | `op(6) rd(5) ra(5) pred(4) imm(12)` | ALU + 12 位立即数 |
-| M | `op(6) rd(5) ra(5) pred(4) imm(12)` | `LDS/STS/LDG/STG` |
-| K | `op(6) rd(5) ra(5) rb(5) pred(4) func(7)` | mask 指令（GPR 操作数，warp 级） |
-| B | `op(6) rs(5) off(21)` | 统一条件分支（`BR.Z/BR.NZ`，测试 GPR 里的 warp 一致 mask） |
-| J | `op(6) off(22)` | 无条件跳转 |
-| SR | `op(6) rd(5) pred(4) sreg(5) …` | `SREAD` |
-| S | `op(6) …` | `EXIT` / `BAR` / `NOP` |
+| R | `op[5:0] rd[10:6] ra[15:11] rb[20:16] pred[24:21] func[31:25]` | ALU / `CMP` / `SEL` / mask |
+| RI | `op[5:0] rd[10:6] ra[15:11] pred[19:16] imm[31:20]` | 立即数 ALU / 访存 / `LUI` / `LUM` |
+| BR | `op[5:0] rs[10:6] off[31:11]`（21 位有符号） | `BRZ` / `BRNZ` |
+| J | `op[5:0] off[31:6]`（26 位有符号） | `JMP` |
+| SR | `op[5:0] rd[10:6] sreg[15:11]` | `SREAD` |
+| SYS | `op[5:0] func[31:25]` | `NOP` / `BAR` / `EXIT` |
 
-`pred` 是 4 位谓词字段：3 位谓词号 + 1 位取反，0 表示无条件执行。
-分支的 mask 操作数必须全 lane 相同，由汇编器保证。
+- `pred` 字段：0 = 无谓词，1..8 = `@p0..@p7`，9..15 保留。谓词取反用相反的比较
+  条件表达（`GE` 代替 `LT`、`NE` 代替 `EQ`），不占单独的取反位。
+- 跳转目标 = `PC + 4 + off × 4`，即相对下一条指令；`BR` 范围 ±2²⁰ 条指令，
+  `JMP` 范围 ±2²⁵ 条。分支的操作数必须全 lane 相同，由汇编器保证。
+- mask 指令的 `.P` 形式把谓词号放在 `rb` 字段（0..7）。
+- `SEL` 的 `pred` 字段是**操作数**（按哪个谓词选值），不是 `@p` 门控；`SEL`
+  本身仍受 `M` 门控。
+
+主操作码：
+
+| op | 指令 | op | 指令 | op | 指令 |
+|---|---|---|---|---|---|
+| `01` | `ADD…MUL` 等 R 格式 ALU | `08` | `SLTI` | `0F` | `BRZ` |
+| `02` | `CMP.cond` | `09` | `LDS` | `10` | `BRNZ` |
+| `03` | `SEL` | `0A` | `STS` | `11` | `JMP` |
+| `04` | `ADDI` | `0B` | `LDG` | `12` | `SREAD` |
+| `05` | `ANDI` | `0C` | `STG` | `13` | `SYS`（`NOP/BAR/EXIT`） |
+| `06` | `ORI` | `0D` | `LUI` | `14` | `LUM` |
+| `07` | `SHLI` | `0E` | mask 指令（`func` 选） | 其余 | 保留 |
+
+`func` 字段（保留值不使用）：
+
+| 组 | func |
+|---|---|
+| ALU（`op=01`） | `ADD=0 SUB=1 AND=2 OR=3 XOR=4 SHL=5 SHR=6 SAR=7 SLT=8 SLTU=9 MUL=A MOV=B` |
+| 比较（`op=02`） | `EQ=0 NE=1 LT=2 GE=3 LTU=4 GEU=5` |
+| mask（`op=0E`） | `MSAVE=0 MREST=1 MMOV=2 MAND=3 MANDN=4 MOR=5 MNOT=6 MAND.P=7 MANDN.P=8 MOR.P=9 MCLR.P=A` |
+| 系统（`op=13`） | `NOP=0 BAR=1 EXIT=2` |
 
 ### 5.4 指令表
 
@@ -133,9 +160,15 @@ ALU（全部 per-lane、可带 `@p`）：
 | 指令 | 语义 |
 |---|---|
 | `ADD/SUB/AND/OR/XOR/SHL/SHR/SAR/SLT/SLTU/MUL` | 每 lane 算术/逻辑/移位/比较，结果写自己的目标寄存器 |
-| `MOV rd, ra` / `LI rd, imm` / `LUI rd, imm` | 搬移和常数装载（拼接出 32 位常数） |
+| `MOV rd, ra` | 每 lane 搬移 |
+| `ADDI/ANDI/ORI/SHLI/SLTI rd, ra, imm` | 12 位立即数 ALU（`imm` 有符号或零扩展按指令定） |
+| `LUI rd, imm12` / `LUM rd, ra, imm12` / `ORI` | 常数分段装载：`imm<<20` / `ra \| imm<<12` / `ra \| imm` |
+| `LI rd, imm` | 伪指令：1–3 条 `ADDI/LUI/LUM/ORI` 拼出任意 32 位常数 |
 | `CMP.cond p, ra, rb` | 每 lane 比较，写自己的谓词（EQ/NE/LT/GE/LTU/GEU） |
-| `SEL rd, ra, rb, p` | 每 lane 按谓词选值，用于短小的条件更新 |
+| `SEL rd, ra, rb, p` | 每 lane 按 `p` 选值（`p` 是操作数），用于短小的条件更新 |
+
+`LI` 用顺序无关的三段拼装：`LUI` 放 bits31:20，`LUM` 放 bits23:12，`ORI` 放
+bits11:0；三段都带 `pred`，所以在收窄的 mask 里也能安全装载常数。
 
 访存（per-lane、可带 `@p`，v0.1 只支持 32 位字）：
 
@@ -158,16 +191,18 @@ mask 指令（warp 级，不受 `M` 门控）：
 | `MAND.P rd, ra, p` | `rd = ra & p & M`（硬件强制与当前 `M` 相干） |
 | `MANDN.P rd, ra, p` | `rd = ra & ~p & M` |
 | `MOR.P rd, ra, p` | `rd = (ra \| p) & M` |
+| `MCLR.P p` | `M = M & ~p`（break/continue 序列用，见 §6.4） |
 
 mask 指令是 warp 级操作：不受 `M` 门控，除 `MREST` 外不改变 `M`。`.P` 形式的
 结果由硬件强制与 `M` 相干，inactive lane 的旧谓词不会把 lane 复活。
+`M` 的写入者只有 `MREST` 和 `MCLR.P`。
 
 控制：
 
 | 指令 | 语义 |
 |---|---|
-| `BR.Z rs, target` | 统一分支：`rs`（全 lane 一致的 mask 值）全零时跳转 |
-| `BR.NZ rs, target` | 统一分支：`rs` 非零时跳转；v0.1 只做零/非零两种条件 |
+| `BRZ rs, target` | 统一分支：`rs`（全 lane 一致的 mask 值）全零时跳转 |
+| `BRNZ rs, target` | 统一分支：`rs` 非零时跳转；v0.1 只做零/非零两种条件 |
 | `JMP target` | 无条件跳转 |
 | `BAR` | 块内屏障；要求 `M` 等于 warp 生成时的完整 mask，否则报错 |
 | `EXIT` | warp 级结束指令，执行到就结束整条 warp |
@@ -194,6 +229,18 @@ mask 指令是 warp 级操作：不受 `M` 门控，除 `MREST` 外不改变 `M`
 shared 和 global 不统一编址：指令本身决定访问哪个空间。访存必须自然对齐；
 非对齐、越界和访问错误码都写进 `STATUS`，然后报错并结束 kernel。
 
+`STATUS` 取值（P0 冻结，非 0 表示 kernel 已经报错结束）：
+
+| 值 | 名字 | 含义 |
+|---|---|---|
+| 0 | `OK` | 正常结束 |
+| 1 | `BAD_INSN` | 保留编码、非法 `func`、非法特殊寄存器 |
+| 2 | `UNALIGNED` | 访存地址不是 4 字节对齐 |
+| 3 | `SMEM_OOB` | shared 地址越界 |
+| 4 | `GMEM_OOB` | global 地址越界 |
+| 5 | `BAR_INCOMPLETE` | `BAR` 时 `M` 不是完整 mask |
+| 6 | `PC_OOB` | 取指超出 IMEM |
+
 ### 5.6 Kernel 调用约定
 
 主机通过 AXI-Lite 写这些寄存器，然后置 `ap_start`：
@@ -209,30 +256,36 @@ shared 和 global 不统一编址：指令本身决定访问哪个空间。访�
 
 启动顺序：主机写 IMEM 镜像 → 写参数 → 置 start → 轮询 done/error。入口固定 `0x0000`。
 
-### 5.7 汇编示例：vecadd（汇编器 lowering 之后的样子）
+### 5.7 汇编示例：vecadd
+
+`S_TID` 是 block 内的全局线程号（`wid * NTID + laneid`），`S_LANEID` 是 lane 在
+warp 内的编号。handwritten 部分：
 
 ```asm
-        ; 特殊寄存器：PTR_A/B/C、N、NTID/NWARP/WID 所有 lane 相同；TID 每 lane 不同
+        ; PTR_A/B/C、ARG0、NTID/NWARP/WID 每条 lane 读出的值相同；TID 每条 lane 不同
         SREAD   r1, S_PTR_A
         SREAD   r2, S_PTR_B
         SREAD   r3, S_PTR_C
-        SREAD   r4, S_N
-        SREAD   r5, S_NTID
-        SREAD   r6, S_NWARP
-        SREAD   r7, S_WID
-        SREAD   r8, S_TID
-        MUL     r9, r6, r5          ; T = NWARP * NTID（每条 lane 冗余计算）
-        MUL     r10, r7, r5         ; wid * NTID
-        ADD     r11, r8, r10        ; i = tid + wid*NTID
-        MSAVE   m_outer             ; 进入循环前的 mask
-        MSAVE   m_loop              ; 循环继续 mask
+        SREAD   r4, S_ARG0          ; n
+        SREAD   r5, S_NWARP
+        SREAD   r6, S_NTID
+        SREAD   r11, S_TID          ; i = wid * NTID + laneid
+        MUL     r9, r5, r6          ; stride = NWARP * NTID（每条 lane 冗余计算）
+```
+
+循环在源码里就是这段手写的 mask 序列（`sim/kernels/vecadd.s` 的内容，`r24` 是循环外的
+mask、`r25` 是继续 mask）：
+
+```asm
+        MSAVE   r24                 ; 进入循环时的 mask，退出后用它重聚
+        MSAVE   r25                 ; 跨迭代的继续 mask
 loop:
-        MREST   m_loop              ; M = 仍在循环里的 lane
-        CMP.LT  p1, r11, r4         ; p1 = (i < n)，每 lane 自己判断
-        MAND.P  m_loop, m_loop, p1  ; 只保留还需要迭代的 lane
-        MREST   m_loop              ; M = 收窄后的 mask
-        BR.Z    m_loop, done        ; 统一分支：没有 lane 需要继续就退出
-        SHL     r12, r11, 2         ; 字节偏移 = i * 4
+        MREST   r25                 ; M = 仍在循环里的 lane
+        CMP.LT  p7, r11, r4         ; 每 lane 自己判断
+        MAND.P  r25, r25, p7        ; 条件不成立的 lane 退出循环
+        MREST   r25
+        BRZ     r25, done           ; 统一分支：没有 lane 需要继续就退出
+        SHLI    r12, r11, 2         ; 字节偏移 = i * 4
         ADD     r13, r12, r1
         LDG     r14, [r13]          ; a[i]
         ADD     r13, r12, r2
@@ -240,106 +293,123 @@ loop:
         ADD     r16, r14, r15
         ADD     r13, r12, r3
         STG     [r13], r16          ; c[i] = a[i] + b[i]
-        ADD     r11, r11, r9        ; i += T
+        ADD     r11, r11, r9        ; i += stride
+        MREST   r25                 ; 下一轮
         JMP     loop
+
 done:
-        MREST   m_outer             ; 重聚：恢复进入循环时的 mask
+        MREST   r24                 ; 重聚：恢复进入循环时的 mask
         EXIT
 ```
 
-这段代码等价于源码里的 `LOOP { ... }`，由汇编器生成；手写汇编时只需要写结构化
-宏（见 §6.4），保存 mask 的 GPR 分配和序列生成由汇编器负责。`m_outer`、`m_loop`
-是汇编器分配的 GPR 别名，值在每条 lane 上相同。
-
-## 6. 控制流：汇编器管理 mask
+## 6. 控制流：手写 mask 序列
 
 ### 6.1 模型
 
 - 硬件只有执行 mask `M` 和 per-lane 谓词 `p0..p7`；保存的 mask 值放在 GPR 里，
-  由汇编器分配。
-- 所有控制流都是统一的：`BR.Z/BR.NZ` 测试 GPR 里的 warp 一致 mask 值，
+  kernel 自己挑寄存器（约定 `r24–r31`）。
+- 所有控制流都是统一的：`BRZ/BRNZ` 测试 GPR 里的 warp 一致 mask 值，
   `JMP` 无条件跳转；v0.1 的分支条件只有零/非零两种。
 - per-lane 条件先写谓词，再由 mask 指令组合进 mask；mask 变窄意味着"这些 lane
   暂时不参与"，mask 恢复意味着重聚。
 - `.P` 类 mask 指令的结果由硬件强制与当前 `M` 相干（`rd = ... & M`），防止
   inactive lane 的旧谓词把 lane 复活。
-- 汇编器把 `IF/ELSE/ENDIF`、`LOOP`、`break/continue` 展开成 mask 序列，做保存
-  mask 的 GPR 分配和静态检查。
+- 汇编器不认识结构化语法：`IF/LOOP/break/continue` 只是写 kernel 时的思路，落到源码
+  里就是 mask 指令加统一分支。下面几节给的是手写模板，抄就行。
 
-### 6.2 IF/ELSE 的 lowering 模板
+### 6.2 IF/ELSE 模板
 
 ```asm
-        ; IF cond ... ELSE ... ENDIF
-        CMP.cond  p, ra, rb
-        MSAVE     m_s
-        MAND.P    m_then, m_s, p   ; then 路径的 lane
-        MREST     m_then           ; M = m_then
+        ; IF cond ... ELSE ... ENDIF（r24 = 入口 mask，r25 = then，r26 = else）
+        CMP.cond  p, ra, rb        ; 在当前 M 下算谓词
+        MSAVE     r24              ; 入口 mask
+        MAND.P    r25, r24, p      ; then 路径的 lane（此刻 M 仍等于 r24）
+        MANDN.P   r26, r24, p      ; else 路径的 lane
+        MREST     r25              ; M = then 路径
         <then body>
-        MANDN.P   m_else, m_s, p   ; else 路径的 lane
-        MREST     m_else           ; M = m_else
+        MSAVE     r25              ; then 路径退出时的 mask（可能被 break/continue 收窄）
+        MREST     r26
         <else body>
-        MREST     m_s              ; merge：恢复两条路径的所有 lane
+        MSAVE     r26
+        MOR       r24, r25, r26    ; 合并两条路径的 lane
+        MREST     r24              ; 重汇聚
 ```
 
-没有 `ELSE` 时省掉 `m_else` 两行，then body 之后直接 `MREST m_s`。空路径可以加
-`BR.Z m_then, ...` / `BR.Z m_else, ...` 跳过，属于汇编器的优化。
+三个要点：
 
-### 6.3 LOOP 的 lowering 模板
+- 两条分支 mask 必须在 `MREST` 之前算出来。`.P` 形式带着 `& M`，一旦先切到 `r25`，
+  `MANDN.P r26, r24, p` 就会被 `& r25` 清成空集。
+- merge 用 `MOR` 合并两条路径的**退出 mask**，不是直接 `MREST r24`。这样路径里的
+  `break/continue` 收窄的 lane 不会在 merge 点被复活。
+- 没有 `ELSE` 时 else 路径什么都没做，它的退出 mask 就是 `r26` 本身，省一条 `MSAVE`。
+
+### 6.3 循环模板
 
 ```asm
-        ; LOOP ... ENDLOOP（条件在头部检查）
-        MSAVE     m_outer             ; 进入循环时的 mask，退出后用它重聚
-        MSAVE     m_loop              ; 循环继续 mask
+        ; LOOP ... ENDLOOP（条件在头部检查；r24 = 循环外的 mask，r25 = 继续 mask）
+        MSAVE     r24                 ; 进入循环时的 mask，退出后用它重聚
+        MSAVE     r25                 ; 循环继续 mask
 L_head:
-        MREST     m_loop              ; M = 仍在循环里的 lane
+        MREST     r25                 ; M = 仍在循环里的 lane
         CMP.cond  p, ra, rb
-        MAND.P    m_loop, m_loop, p   ; 收窄：条件不成立的 lane 退出循环
-        MREST     m_loop              ; M = 收窄后的 mask
-        BR.Z      m_loop, L_done      ; 统一分支：没有 lane 继续就退出
+        MAND.P    r25, r25, p         ; 收窄：条件不成立的 lane 退出循环
+        MREST     r25                 ; M = 收窄后的 mask
+        BRZ       r25, L_done         ; 统一分支：没有 lane 继续就退出
         <body>
 L_latch:
-        MREST     m_loop              ; 恢复到循环 mask（continue 的 lane 在这里回归）
-        <increment>
+        MREST     r25                 ; 恢复 continue 的 lane
         JMP       L_head
 L_done:
-        MREST     m_outer             ; 重聚：恢复进入循环时的 mask
+        MREST     r24                 ; 重聚：恢复进入循环时的 mask
 ```
 
-### 6.4 break/continue 的 lowering
+循环是 while 语义：`continue` 跳过本轮剩余部分（包括写在 body 末尾的自增），
+下一轮从头部条件重新开始。头部收窄 `r25` 是永久性的——这些 lane 已经算出
+"不必再迭代"，只有 `L_done` 的 `MREST r24` 才把它们放回来。
 
-`break`（当前循环里，`q` 是 break 条件谓词）：
+### 6.4 break/continue 序列
+
+`break`（`q` 是 break 条件谓词，`r5` 是临时 mask 寄存器）：
 
 ```asm
         CMP.cond  q, ra, rb
-        MANDN.P   m_loop, m_loop, q   ; 这些 lane 永久退出循环
-        MANDN.P   M, M, q             ; 本迭代剩余部分不再执行
+        MSAVE     r5                  ; 当前活跃 lane（r5 是临时数据寄存器，别和 kernel 的撞）
+        MAND.P    r5, r5, q           ; 其中满足 break 条件的
+        MANDN     r25, r25, r5        ; 这些 lane 永久退出循环
+        MCLR.P    q                   ; 本迭代剩余部分不再执行
 ```
 
-`continue`（`r` 是 continue 条件谓词）：
+不能直接写 `MANDN.P r25, r25, q`：`.P` 形式会 `& M`，而 `M` 往往比 `r25` 窄（比如
+break 写在 `IF` 的 then 路径里），那样会把 else 路径的 lane 也从循环里删掉。所以先用
+`MSAVE`+`MAND.P` 组合出"正在退出"的 lane 集合，再用不带 `.P` 的 `MANDN` 减掉。
+
+`continue`（`q` 是 continue 条件谓词）：
 
 ```asm
-        CMP.cond  r, ra, rb
-        MANDN.P   M, M, r             ; 本迭代剩余部分不再执行，但仍留在 m_loop
+        CMP.cond  q, ra, rb
+        MCLR.P    q                   ; 本迭代剩余部分不再执行，但仍留在 r25 里
 ```
 
-continue 的 lane 在 `L_latch` 的 `MREST m_loop` 回归，然后照常执行 increment；
-break 的 lane 已经不在 `m_loop` 里，直到 `L_done` 的 `MREST m_outer` 才回归。
-`break/continue` 里嵌在 `IF/ELSE` 内部时，IF 的 merge mask 必须由汇编器根据两条
-路径的 continuation mask 重新计算（不是简单 `MREST m_s`），这部分数据流分析是
-汇编器的核心工作。
+continue 的 lane 在 `L_latch` 的 `MREST r25` 回归，下一轮照常从头部开始；
+break 的 lane 已经不在 `r25` 里，直到 `L_done` 的 `MREST r24` 才回归。
+`break/continue` 写在 `IF/ELSE` 里面时，收窄会穿过 §6.2 的 `MSAVE`+`MOR` merge，
+所以 merge 之后只有"还该继续执行"的 lane 留在 `M` 里。
+
+无条件写法：`BREAK` 用 `MMOV r25, r0` + `MREST r0`，`CONTINUE` 用 `MREST r0`。
 
 ### 6.5 重聚与限制
 
 - 重聚是显式的：每个结构化区域在 merge 点用 `MREST` 恢复 mask。没有重聚栈，
   也没有栈深限制；硬件不知道也不关心嵌套层级。
-- 嵌套深度受保存 mask 的 GPR 压力限制。汇编器分配 GPR；不够时给出警告并溢出到
-  shared memory，具体策略留到写软件/汇编器时实现。
-- `BAR` 要求 `M` 等于 warp 生成时的完整 mask；汇编器静态检查 `BAR` 不在 mask
-  收窄的区域里，硬件保留运行时兜底。
+- 保存 mask 的 GPR 约定用 `r24–r31`（8 个），kernel 自己分配和复用；数据寄存器用
+  `r1–r23`，别撞上。模板里的临时谓词用 `p6`/`p7`，把低编号谓词留给数据。
+- 嵌套深度受这 8 个掩码寄存器限制，不够就把 mask 值溢出到 shared memory（还没做，
+  见 §11）。
+- `BAR` 要求 `M` 等于 warp 生成时的完整 mask，由**硬件在运行时**检查，不满足就报
+  `BAR_INCOMPLETE`。汇编器不做这个静态检查。
 - `EXIT` 是 warp 级指令，执行到就结束整条 warp；不要求 `M` 是完整 mask。
 - mask 指令是 warp 级操作，不受 `M` 门控；普通 ALU/访存同时受 `M` 和 `@p` 门控。
-- 不允许跳进/跳出结构化区域（汇编器检查）。`break/continue` 的语言支持范围
-  （最内层、带标签、跨层）是汇编器/语言的事，硬件不限制。
+- 不要随便跳进/跳出 mask 区域：标签在映像里就是地址，跳错了没有编译错误，只有跑飞。
 
 ## 7. 流水线
 
@@ -390,18 +460,18 @@ GPU 顶层做成标准 Vitis RTL kernel：
 ## 11. 开放问题
 
 - `IF/ELSE` 和简单分支是否用 if-conversion（`SEL`/`@p`）替代 mask 序列，阈值和
-  默认策略等汇编器/编译器实现时再定。
-- `break/continue` 的语言支持范围（最内层、标签、跨层）——硬件不做限制，属于
-  汇编器/语言设计。
-- 保存 mask 的 GPR 压力、溢出到 shared 的策略和告警方式（软件阶段再定）。
+  默认策略等写汇编器优化时再定。
+- 要不要把 `IF/ELSE/ENDIF`、`LOOP` 这类结构化语法和 mask 寄存器分配做进汇编器——
+  现在只做翻译、掩码序列手写；写起来太啰嗦再说。
+- 汇编器静态检查（跨区域跳转、`BAR` 的 mask、掩码寄存器压力）——同上，先不加，
+  靠代码审查和硬件运行时兜底。
+- 掩码寄存器组只有 8 个：更深的嵌套要不要溢出到 shared、怎么溢出（软件阶段再定）。
 - 是否需要 mask 零/非零之外的统一分支条件（v0.1 先不做，需要时再加指令）。
 - `SK_NUM_LANES` 取 4 还是 8（综合实验定）。
 - IMEM 16 KB、shared 32 KB 是否够用；shared bank 数取 lane 数还是 2×lane 数。
 - scoreboard 需要多少个 outstanding slot。
 - sgemm 是否需要 `MUL` 之外的整数除法，还是用移位/循环代替。
 - 字节/半字访存什么时候加（v0.1 只做 32 位字）。
-- 指令编码里的谓词字段、mask 字段、立即数宽度、保留编码的最终分配。
-- 错误码的具体取值和主机可见方式。
 - 是否在 P5 加一个小 L1 或只做 coalescer。
 
 ## 12. 关键决策
@@ -409,7 +479,7 @@ GPU 顶层做成标准 Vitis RTL kernel：
 ### 12.1 自定义 32 位定长 ISA，不用 RISC-V
 
 指令集完全自己设计，不背 RISC-V 兼容包袱，也不考虑高级编译器：kernel 手写汇编，
-工具链只有 Python 汇编器和黄金模型。好处是编码、译码、汇编全部在掌控之中，
+工具链只有汇编器和黄金模型。好处是编码、译码、汇编全部在掌控之中，
 教学覆盖面完整；代价是没有现成工具链，汇编器和黄金模型必须在 P0 先写好。
 
 ### 12.2 去掉统一/标量通路
@@ -431,11 +501,15 @@ GPU 顶层做成标准 Vitis RTL kernel：
 就能解析；分歧的正确性主要落在生成出来的 mask 序列上，硬件可以做成一组很简单的
 位运算。mask 值用 GPR 保存，不需要专用 mask 寄存器堆。
 
-**代价**：汇编器变成一个小型控制流编译器，要做 lowering、保存 mask 的 GPR 分配、
-break/continue 的数据流分析和静态检查；mask 指令本身有指令数开销（每个 IF/ELSE
-大约几条 mask 指令，循环每轮几条），保存 mask 的 GPR 也会增加寄存器压力（不够时
-溢出到 shared，留到软件阶段处理）；验证负担从硬件转移到"汇编器生成的 mask 序列"
-上——必须给汇编器配独立的 lowering 测试和 mask 序列检查。
+**代价**：mask 序列要手写——每个 `IF/ELSE` 大约几条 mask 指令、循环每轮几条，寄存器
+压力也落在写 kernel 的人身上（`r24–r31` 八个掩码寄存器，不够就溢出到 shared，留到
+软件阶段处理）；验证负担从硬件转移到"手写的 mask 序列"上，所以 §6 的模板和
+`sim/kernels/` 里的例子就是规范，测试也跟着测这些序列。
+
+具体做法（P0）：汇编器只做编码（`sim/src/asm.rs`，一行一条指令）；掩码序列按 §6 的
+模板手写。`IF` 的 merge 用两条路径退出 mask 的 `MOR`，这样路径里的 break/continue
+收窄不会被 merge 撤销。`.P` 形式的 `& M` 是坑：从比 `M` 宽的外层 mask 里删 lane 必须
+绕开 `.P`（见 §6.4）。
 
 ### 12.4 两个地址空间、独立 load/store
 
