@@ -55,16 +55,23 @@
 
 **交付物**
 
-- `rtl/lib/`：`SK_elastic_buffer.sv`、`SK_dp_ram.sv`、`SK_generic_arbiter.sv`。
-- `rtl/core/`：`SK_fetch.sv`、`SK_decode.sv`、`SK_regfile.sv`（LUTRAM，3 读 1 写）、
-  `SK_alu.sv`、`SK_lsu.sv`、`SK_branch.sv`（统一分支）、`SK_mask.sv`（1 位 mask 版本）、
-  `SK_commit.sv`；`rtl/top/SK_core.sv`。
-- `rtl/mem/SK_imem.sv`：BRAM 指令存储，PC 取指；主机装载口到 P6 再接。
-- `tb/tb_core.cpp`：Verilator testbench + IMEM/shared/global 内存模型 + 黄金模型
-  dump 比对。
+- `rtl/SK_pkg.sv`：译码结果、ALU 微操作、mask 指令和 STATUS 的类型定义。
+- `rtl/lib/SK_dp_ram.sv`：BRAM 模板（一个写口 + 一个同步读口），IMEM 用它。
+- `rtl/mem/SK_imem.sv`：指令存储，PC 取指；主机装载口已经有了（P6 接 AXI-Lite）。
+- `rtl/core/`：`SK_decode.sv`（译码 + 保留编码检查）、`SK_regfile.sv`（LUTRAM，3 读 1 写，
+  外加一个仿真用扫描口）、`SK_alu.sv`（RALU + 立即数 ALU + 比较器）、`SK_mask.sv`
+  （1 位 `M` 的 mask 单元，含 `.P`/`.PM`）、`SK_lsu.sv`（地址、对齐、访存通道），
+  以及 2 级流水的 `SK_core.sv`（取指 / 译码+执行+写回，统一分支在执行级解析）。
+- `tb/tb_core.cpp`：Verilator testbench + IMEM/shared/global 内存模型 + 黄金模型 dump
+  比对；测试程序在 `tb/programs/`（5 个汇编程序）。汇编器编不出非法程序，所以
+  BAD_INSN（保留编码）和 PC_OOB（跳出 IMEM）两个用例的镜像由 Makefile 直接写字节。
 - 跑通 `sum = 0; for (i = 0; i < 10; i++) sum += i;`，得到 45。
 
-**验收**：Verilator 里跑通 5 个单 lane 汇编程序，结果与黄金模型逐寄存器一致。
+**验收**：`make rtl-sim` 跑通 5 个单 lane 汇编程序（sum / alu / if-else / mem / sreg）
+和 BAD_INSN / PC_OOB 两个错误码用例，状态与黄金模型逐寄存器一致。
+
+**状态**：已完成。核是 2 级而不是 5 级——BRAM 取指一拍、执行级同拍写回，够跑通单 lane
+的全部语义；N lane 和 5 级流水分别在 P2、P3（和调度器、scoreboard 一起）展开。
 
 ## P2 — N lane SIMT
 
@@ -187,7 +194,7 @@ mask 指令计数和理论值一致（汇编器的开销可见、可统计）；
 | 层 | 工具 | 速度 | 用途 |
 |---|---|---|---|
 | 黄金模型 | `sim/src/golden.rs` | 毫秒 | 语义正确性的唯一裁判 |
-| RTL 仿真 | Verilator + `tb/` | 秒～分钟 | 每次改动后的回归 |
+| RTL 仿真 | Verilator + `tb/`（`make rtl-sim`） | 秒～分钟 | 每次改动后的回归 |
 | 上板 | Vivado + XRT | 小时 | 真实硬件与真实频率 |
 
 任何 RTL 改动都必须在"RTL 仿真 vs 黄金模型"这一层验证过，才允许进入综合或上板。

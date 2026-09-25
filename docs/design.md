@@ -63,6 +63,10 @@ RTL 宏集中在 [SK_config.vh](../rtl/SK_config.vh)：
                  └─────────────────────────────────────────────────────────┘
 ```
 
+P1 落地的只是其中一部分：`SK_imem`、`SK_decode`、`SK_regfile`、`SK_alu`、`SK_mask`、
+`SK_lsu`，加一个 2 级的 `SK_core`（见 §7）。图里其余模块（调度器、scoreboard、
+coalescer、AXI、上板壳）随 P2–P6 加，清单见 [plan.md](plan.md)。
+
 ## 4. 执行模型
 
 - **lane（thread）**：有自己的 32 个通用寄存器和 8 个谓词；没有独立 PC。
@@ -479,6 +483,10 @@ v0.1 采用 5 级流水线；lane 数取 8 时可以在 S3/S4 之间加一级操
 不预测分支：统一分支在 S3 解析，命中则重定向并清掉年轻指令；解析前该 warp 停止
 发射，其他 warp 继续。每个 warp 一个 scoreboard（4–8 个 slot）跟踪 `LDG` 的目标
 寄存器；`STG` 是 posted write，用 outstanding 计数在内核结束前排空。
+
+P1 先做 2 级：BRAM 取指一拍，加一个执行级，执行级同拍写回（寄存器堆是"写在下一条
+指令读之前"，不用前递）；统一分支也在这一级解析，命中就把在途的取指丢掉，代价是一个
+空泡。拆成 5 级和 P3 的调度器、scoreboard 一起做。
 
 ## 8. 存储层次
 
