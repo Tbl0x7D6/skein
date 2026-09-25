@@ -19,7 +19,7 @@ RTL 宏集中在 [SK_config.vh](../rtl/SK_config.vh)：
 
 ```systemverilog
 `define SK_XLEN        32      // 数据宽度
-`define SK_NUM_LANES    4      // 每个 warp 的 lane 数（4/8，综合实验定）
+`define SK_NUM_LANES    4      // warpSize；每个 warp 的 lane 数（4/8，综合实验定）
 `define SK_NUM_WARPS    4      // 每核 warp 数
 `define SK_NUM_GPR      32     // 每 lane 通用寄存器数（r0 恒为 0）
 `define SK_NUM_PRED     8      // 每 lane 谓词数
@@ -29,9 +29,9 @@ RTL 宏集中在 [SK_config.vh](../rtl/SK_config.vh)：
 ```
 
 执行 mask `M` 是硬件寄存器（N 位），通过 `MSAVE/MREST` 与通用寄存器交换；`M` 的
-写入者还有 `MCLR.P`（见 §5.4）。保存的 mask 值放在 GPR 里，由 kernel 自己分配和
-复用（约定用 r24–r31，见 §6.5）；不够时得自己溢出到 shared memory，策略留到写软件
-阶段再说。
+写入者还有 `MCLR.P` 和 `.PM` 形式（见 §5.4）。保存的 mask 值放在 GPR 里，由 kernel
+自己分配和复用（约定用 r24–r31，见 §6.5）；不够时得自己溢出到 shared memory，
+策略留到写软件阶段再说。
 
 `sim/src/isa.rs` 里的常量与这份参数保持一致。
 
@@ -80,10 +80,16 @@ RTL 宏集中在 [SK_config.vh](../rtl/SK_config.vh)：
   进入循环时的 mask；`break/continue` 用 mask 更新表达。这些都由汇编器生成。
 - **mask 与谓词分工**：`M` 表示"哪些 lane 当前可执行"，由 mask 指令维护，硬件用它
   门控写回和访存；谓词表示"这条 lane 这个条件是否成立"，用于 `@p` 和 mask 计算。
-- **block / CTA**：v0.1 一核跑一个 block；grid 由主机顺序启动，v0.1 只用 1 个 block。
-- **warp 的生成与结束**：硬件按 `BLOCK_DIM`/`NWARP` 生成 warp，每条 warp 从入口
-  `0x0000` 开始执行；`EXIT` 是 warp 级指令，执行到就结束整条 warp；所有 warp 结束后
-  硬件置 done。
+- **block / CTA**：一次启动跑一个 block，block 之间**串行**执行——前一个 block
+  全部 `EXIT` 后，硬件把 PC、寄存器、谓词、mask 复位，再从入口跑下一个 block。
+  `BLOCK_DIM`（主机写的 `blockDim.x`）决定 block 有多少线程：`1 ≤ BLOCK_DIM ≤
+  NWARP × WARPSZ` 且必须是 `WARPSZ` 的整数倍（不允许部分 warp），非法值在 start 时报
+  `BAD_LAUNCH`。block 数由主机的 `GRID_DIM` 决定，`S_BID` 是当前 block 索引（只读），
+  对齐 `blockIdx`；shared/global 在 block 之间不清零。
+- **warp 的生成与结束**：硬件有 `NWARP` 条 warp、每条 `WARPSZ` 个 lane；一次启动只激活
+  前 `BLOCK_DIM / WARPSZ` 条（每条都是满 warp），其余直接 done。每条 warp 从入口
+  `0x0000` 开始执行；`EXIT` 是 warp 级指令，执行到就结束整条 warp；所有活跃 warp
+  结束后硬件置 done。
 - **汇编器的职责**：只做翻译——一行一条指令，认标签，编码成 32 位字。掩码序列
   （`MSAVE`/`MREST`/`MAND.P`/`MCLR.P`）是普通指令，由 kernel 手写；写法模板见 §6，
   完整例子见 [sim/kernels/vecadd.s](../sim/kernels/vecadd.s)。
@@ -95,21 +101,26 @@ RTL 宏集中在 [SK_config.vh](../rtl/SK_config.vh)：
 - 32 位定长指令，6 位主操作码，PC 每步 +4。定长让取指、分支偏移和译码都很简单。
 - 不兼容任何现成 ISA，也不考虑高级编译器：kernel 用手写汇编写，分歧用 mask 序列
   表达；汇编器只负责编码。
-- 指令可以带谓词（`@p`）：谓词为假的 lane 不写回、不访存。
+- 指令可以带谓词门控 `@p` / `@!p`（取反）：谓词为假的 lane 不写回、不访存。取反位只
+  存在于 R/SR 格式；RI 格式（立即数 ALU 和 `LDS/STS/LDG/STG`）只有不取反的 `@p`。
 - 控制流统一：没有 per-lane 分支，分支只测试 GPR 里的 mask 值（零/非零）或无条件跳转。
-- 指令集不提供 warp 级归约指令；需要归约时用 shared memory + `BAR` 自己搭。
+- 不提供 warp 级**数据**归约指令：归约用 `SHFL.*` 按 log N 步自己搭（也可以走
+  shared memory + `BAR`）。warp 级只有谓词投票 `VOTE.*`，没有别的跨 lane 运算。
 
 ### 5.2 寄存器与掩码
 
 | 类别 | 数量 | 说明 |
 |---|---|---|
 | `r0–r31` | 每 lane 32×32b | 通用寄存器，`r0` 恒为 0 |
-| `p0–p7` | 每 lane 8×1b | 谓词，由比较指令写；用于 `@p` 谓词化和 mask 计算 |
+| `p0–p7` | 每 lane 8×1b | 谓词，由比较指令写；用于 `@p`/`@!p` 门控和 mask 计算 |
 | `M` | 每 warp 1 个 N 位 | 执行 mask（唯一的硬件 mask 状态），门控写回和访存 |
 | 保存的 mask | 放在 GPR 里 | 由汇编器分配；全 lane 保存同一份副本（warp 一致） |
-| 特殊寄存器 | 只读 | `TID/LANEID` 每 lane 不同；`WID/NTID/NWARP/GRID/PTR0–2/ARG0–2/STATUS` 每条 lane 读出的值相同 |
+| 特殊寄存器 | 只读 | `TID/LANEID` 每 lane 不同；`WID/BID/WARPSZ/BLOCK_DIM/NWARP/GRID/PTR0–2/ARG0–2/STATUS` 每条 lane 读出的值相同 |
 
-特殊寄存器用 `SREAD rd, sreg` 读入通用寄存器。
+特殊寄存器用 `SREAD rd, sreg` 读入通用寄存器。`WARPSZ` 是 warpSize（每个 warp 的 lane
+数，硬件上是 `SK_NUM_LANES`），`BLOCK_DIM` 是主机给的 block 线程数（= `blockDim.x`），
+`TID = WID × WARPSZ + LANEID` 是 block 内的线程号（活跃范围 0 … `BLOCK_DIM - 1`，
+对齐 `threadIdx`），`BID` 是当前 block 索引（对齐 `blockIdx`），`GRID`/`NWARP` 是总数。
 
 ### 5.3 编码格式
 
@@ -117,60 +128,72 @@ P0 冻结。位序从低位写起，立即数和分支/跳转偏移都以**指�
 
 | 格式 | 位分配 | 用途 |
 |---|---|---|
-| R | `op[5:0] rd[10:6] ra[15:11] rb[20:16] pred[24:21] func[31:25]` | ALU / `CMP` / `SEL` / mask |
-| RI | `op[5:0] rd[10:6] ra[15:11] pred[19:16] imm[31:20]` | 立即数 ALU / 访存 / `LUI` / `LUM` |
-| BR | `op[5:0] rs[10:6] off[31:11]`（21 位有符号） | `BRZ` / `BRNZ` |
-| J | `op[5:0] off[31:6]`（26 位有符号） | `JMP` |
-| SR | `op[5:0] rd[10:6] sreg[15:11]` | `SREAD` |
-| SYS | `op[5:0] func[31:25]` | `NOP` / `BAR` / `EXIT` |
+| R | `op[5:0] rd[10:6] ra[15:11] rb[20:16] pred[24:21] func[28:25] pinv[29]` | 类 `00`：ALU/`CMP`/`SEL`/`SHFL`/`VOTE`；类 `11_1`：mask |
+| RI | `op[5:0] rd[10:6] ra[15:11] pred[19:16] imm[31:20]` | 类 `01`：立即数 ALU/`LUI`/`LUM`；类 `10`：`LDS/STS/LDG/STG`（没有 `pinv`） |
+| BR | `op[5:0] rs[10:6] off[31:11]`（21 位有符号） | 类 `11_0`：`BRZ` / `BRNZ` |
+| J | `op[5:0] off[31:6]`（26 位有符号） | 类 `11_0`：`JMP` |
+| SR | `op[5:0] rd[10:6] sreg[15:11] pred[24:21] pinv[29]` | 类 `11_1`：`SREAD` |
+| SYS | `op[5:0] func[28:25]` | 类 `11_1`：`NOP` / `BAR` / `EXIT` |
 
-- `pred` 字段：0 = 无谓词，1..8 = `@p0..@p7`，9..15 保留。谓词取反用相反的比较
-  条件表达（`GE` 代替 `LT`、`NE` 代替 `EQ`），不占单独的取反位。
+- `func` 是 4 位：各指令组最多 16 个编码（ALU 用 13 个、mask 用 11 个、条件用 6 个）。
+- `pred` 字段：0 = 无谓词，1..8 = `@p0..@p7`，9..15 保留。`pinv` 位为 1 表示
+  `@!p`，所以取反不占用谓词号，也不需要把条件反过来写。
+- `@!p` 只对带 `pinv` 的格式有效：R（ALU/`CMP`/mask）和 SR（`SREAD`）。RI 格式的
+  bit29 属于 `imm`，只有 `@p`；`@!p` 要改用相反的比较条件（`GE`↔`LT`、`NE`↔`EQ`、
+  `GEU`↔`LTU`）。汇编器遇到硬件不支持的门控直接报错，不静默降级。
+- R/SR/SYS 的 bit31:30 保留，必须写 0。
 - 跳转目标 = `PC + 4 + off × 4`，即相对下一条指令；`BR` 范围 ±2²⁰ 条指令，
   `JMP` 范围 ±2²⁵ 条。分支的操作数必须全 lane 相同，由汇编器保证。
 - mask 指令的 `.P` 形式把谓词号放在 `rb` 字段（0..7）。
 - `SEL` 的 `pred` 字段是**操作数**（按哪个谓词选值），不是 `@p` 门控；`SEL`
   本身仍受 `M` 门控。
 
-主操作码：
+主操作码按"类 + 类内子码"分配：`op[5:4]` 是类，`op[3:0]` 是子码。新指令只在已有的
+段里分配，不新开类；不占用的子码保持预留（保留编码被硬件当非法指令拒绝）。
 
-| op | 指令 | op | 指令 | op | 指令 |
-|---|---|---|---|---|---|
-| `01` | `ADD…MUL` 等 R 格式 ALU | `08` | `SLTI` | `0F` | `BRZ` |
-| `02` | `CMP.cond` | `09` | `LDS` | `10` | `BRNZ` |
-| `03` | `SEL` | `0A` | `STS` | `11` | `JMP` |
-| `04` | `ADDI` | `0B` | `LDG` | `12` | `SREAD` |
-| `05` | `ANDI` | `0C` | `STG` | `13` | `SYS`（`NOP/BAR/EXIT`） |
-| `06` | `ORI` | `0D` | `LUI` | `14` | `LUM` |
-| `07` | `SHLI` | `0E` | mask 指令（`func` 选） | 其余 | 保留 |
+| `op[5:4]` | 类 | `op[3:0]` 分配 |
+|---|---|---|
+| `00` | R 向量执行 | `0000` RALU（`func` 选）；`0100`–`0111` `CMP`（`bop = op[1:0]`：00 直接赋值 / 01 AND / 10 OR / 11 XOR）；`1000` `SEL`；`1001` `SHFL`；`1010` `VOTE`；其余预留 |
+| `01` | RI 立即数 ALU | `0000`–`0110` = `ADDI/ANDI/ORI/SHLI/SLTI/LUI/LUM`；其余预留 |
+| `10` | RI 访存 | `0000`–`0011` = `LDS/STS/LDG/STG`；其余留给字节/半字和原子（`0x24`–`0x2F`） |
+| `11_0` | 控制流 | `000`–`010` = `BRZ/BRNZ/JMP`（`0x30`–`0x32`）；其余留给更多统一分支条件 |
+| `11_1` | warp 级 / 系统 | `000`–`010` = `MASK/SREAD/SYS`（`0x38`–`0x3A`）；其余预留 |
+
+`CMP` 的谓词组合修饰（`AND`/`OR`/`XOR`）直接用主操作码的子码区分，不放进 `func`：
+`func` 只有 4 位，装不下 6 个条件 × 4 种修饰。
+
+类决定格式：类 `01`/`10` 是 RI（`pred` 在 `[19:16]`、没有 `pinv`），其余是 R/BR/J/SR/SYS。
 
 `func` 字段（保留值不使用）：
 
-| 组 | func |
-|---|---|
-| ALU（`op=01`） | `ADD=0 SUB=1 AND=2 OR=3 XOR=4 SHL=5 SHR=6 SAR=7 SLT=8 SLTU=9 MUL=A MOV=B` |
-| 比较（`op=02`） | `EQ=0 NE=1 LT=2 GE=3 LTU=4 GEU=5` |
-| mask（`op=0E`） | `MSAVE=0 MREST=1 MMOV=2 MAND=3 MANDN=4 MOR=5 MNOT=6 MAND.P=7 MANDN.P=8 MOR.P=9 MCLR.P=A` |
-| 系统（`op=13`） | `NOP=0 BAR=1 EXIT=2` |
+| 组 | 操作码 | func |
+|---|---|---|
+| ALU | 类 `00` / 子码 `0000` | `ADD=0 SUB=1 AND=2 OR=3 XOR=4 SHL=5 SHR=6 SAR=7 SLT=8 SLTU=9 MUL=A MOV=B FMA=C` |
+| 比较 | 类 `00` / 子码 `0100`–`0111` | `EQ=0 NE=1 LT=2 GE=3 LTU=4 GEU=5`（`func` 是条件，`bop` 看子码） |
+| mask | 类 `11_1` / 子码 `000` | `MSAVE=0 MREST=1 MMOV=2 MAND=3 MANDN=4 MOR=5 MNOT=6 MAND.P=7 MANDN.P=8 MOR.P=9 MCLR.P=A MAND.PM=B MANDN.PM=C MOR.PM=D` |
+| 系统 | 类 `11_1` / 子码 `010` | `NOP=0 BAR=1 EXIT=2` |
+| SHFL | 类 `00` / 子码 `1001` | `IDX=0 UP=1 DOWN=2 BFLY=3` |
+| VOTE | 类 `00` / 子码 `1010` | `ANY=0 ALL=1` |
 
 ### 5.4 指令表
 
-ALU（全部 per-lane、可带 `@p`）：
+ALU（全部 per-lane、可带 `@p`/`@!p`）：
 
 | 指令 | 语义 |
 |---|---|
 | `ADD/SUB/AND/OR/XOR/SHL/SHR/SAR/SLT/SLTU/MUL` | 每 lane 算术/逻辑/移位/比较，结果写自己的目标寄存器 |
+| `FMA rd, ra, rb` | 每 lane 乘加：`rd = rd + ra × rb`（低 32 位回绕；`rd` 既读又写，所以寄存器堆要 3 个读端口） |
 | `MOV rd, ra` | 每 lane 搬移 |
 | `ADDI/ANDI/ORI/SHLI/SLTI rd, ra, imm` | 12 位立即数 ALU（`imm` 有符号或零扩展按指令定） |
 | `LUI rd, imm12` / `LUM rd, ra, imm12` / `ORI` | 常数分段装载：`imm<<20` / `ra \| imm<<12` / `ra \| imm` |
 | `LI rd, imm` | 伪指令：1–3 条 `ADDI/LUI/LUM/ORI` 拼出任意 32 位常数 |
-| `CMP.cond p, ra, rb` | 每 lane 比较，写自己的谓词（EQ/NE/LT/GE/LTU/GEU） |
+| `CMP.cond[.AND\|.OR\|.XOR] p, ra, rb` | 每 lane 比较写谓词（EQ/NE/LT/GE/LTU/GEU）；带修饰时是读改写：`p &= / \|= / ^= cond(ra, rb)`，不带修饰直接赋值 |
 | `SEL rd, ra, rb, p` | 每 lane 按 `p` 选值（`p` 是操作数），用于短小的条件更新 |
 
 `LI` 用顺序无关的三段拼装：`LUI` 放 bits31:20，`LUM` 放 bits23:12，`ORI` 放
 bits11:0；三段都带 `pred`，所以在收窄的 mask 里也能安全装载常数。
 
-访存（per-lane、可带 `@p`，v0.1 只支持 32 位字）：
+访存（per-lane、可带 `@p`；RI 格式，没有 `@!p`；v0.1 只支持 32 位字）：
 
 | 指令 | 空间 | 语义 |
 |---|---|---|
@@ -188,14 +211,20 @@ mask 指令（warp 级，不受 `M` 门控）：
 | `MANDN rd, ra, rb` | `rd = ra & ~rb` |
 | `MOR rd, ra, rb` | `rd = ra \| rb` |
 | `MNOT rd, ra` | `rd = ~ra` |
-| `MAND.P rd, ra, p` | `rd = ra & p & M`（硬件强制与当前 `M` 相干） |
-| `MANDN.P rd, ra, p` | `rd = ra & ~p & M` |
-| `MOR.P rd, ra, p` | `rd = (ra \| p) & M` |
+| `MAND.P rd, ra, p` | `rd = ra & (p & M)` |
+| `MANDN.P rd, ra, p` | `rd = ra & ~(p & M)` |
+| `MOR.P rd, ra, p` | `rd = ra \| (p & M)` |
+| `MAND.PM rd, ra, p` | 同 `MAND.P`，并且 `M = rd` |
+| `MANDN.PM rd, ra, p` | 同 `MANDN.P`，并且 `M = rd` |
+| `MOR.PM rd, ra, p` | 同 `MOR.P`，并且 `M = rd` |
 | `MCLR.P p` | `M = M & ~p`（break/continue 序列用，见 §6.4） |
 
-mask 指令是 warp 级操作：不受 `M` 门控，除 `MREST` 外不改变 `M`。`.P` 形式的
-结果由硬件强制与 `M` 相干，inactive lane 的旧谓词不会把 lane 复活。
-`M` 的写入者只有 `MREST` 和 `MCLR.P`。
+mask 指令是 warp 级操作：不受 `M` 门控，结果写所有 lane。`.P`/`.PM` 的谓词按
+`p & M` 读，之后是普通位运算——`M` 只过滤谓词，**不再对结果 `& M`**：inactive lane
+的旧谓词不会把 lane 复活（`p & M` 已经把它们清掉），但结果里 `ra` 原有的位不会被
+`M` 截掉；要交集就显式把当前 mask 当 `ra`（break 模板就是这么写的）。
+`M` 的写入者是 `MREST`、`MCLR.P` 和 `.PM` 形式：`.PM` 用旧 `M` 算完新值后，
+同一拍把 `rd` 和 `M` 都写成 `结果 & full`。
 
 控制：
 
@@ -212,9 +241,28 @@ mask 指令是 warp 级操作：不受 `M` 门控，除 `MREST` 外不改变 `M`
 
 | 指令 | 语义 |
 |---|---|
-| `SREAD rd, sreg` | 读特殊寄存器到每 lane 的通用寄存器 |
+| `SREAD rd, sreg` | 读特殊寄存器到每 lane 的通用寄存器；可带 `@p`/`@!p` 门控 |
 
-刻意没有的指令：per-lane 分支、分支重聚点字段、重聚栈、warp 级归约指令；
+warp 协作（R 格式；`SHFL` 是 per-lane 写回，`VOTE` 是 warp 级写回）：
+
+| 指令 | 语义 |
+|---|---|
+| `SHFL.IDX rd, ra, rb` | `rd = ra[src]`，`src = rb % WARPSZ` |
+| `SHFL.UP rd, ra, rb` | `src = lane - rb` |
+| `SHFL.DOWN rd, ra, rb` | `src = lane + rb` |
+| `SHFL.BFLY rd, ra, rb` | `src = lane ^ rb`（蝴蝶归约） |
+| `VOTE.ANY rd, p` | `M` 里有 lane 满足 `p` 就 `rd = 1`，否则 `0` |
+| `VOTE.ALL rd, p` | `M` 里所有 lane 都满足 `p` 就 `rd = 1`（`M` 为空也算 1），否则 `0` |
+
+`SHFL` 的边界规则照抄 NV：源 lane 越界（`UP` 下溢、`DOWN` 溢出、`BFLY` 超出 warp）或者
+源 lane 不在 `M` 里，就返回**自己的值**，不报错——inactive lane 的寄存器内容没有意义。
+`SHFL` 读的是同一拍所有 lane 的旧值（写回不会影响别的 lane 的源值），写回本身受 `M`
+和 `@p`/`@!p` 门控。`VOTE` 是 warp 级指令：**结果写所有 lane 的 GPR**、不受 `M` 写回
+门控，所以 `BRNZ/BRZ` 读 lane 0 也一定能拿到结果；`VOTE` 自己不接受 `@p` 门控。
+`rb` 是寄存器（没有立即数变体）；`VOTE` 的谓词号放 `rb` 字段，和 mask 的 `.P` 形式一致。
+
+刻意没有的指令：per-lane 分支、分支重聚点字段、重聚栈、warp 级数据归约指令
+（`VOTE` 只投谓词票，不做数据归约）；
 `M` 只能通过 `MREST` 修改。
 
 ### 5.5 地址空间与对齐
@@ -240,6 +288,7 @@ shared 和 global 不统一编址：指令本身决定访问哪个空间。访�
 | 4 | `GMEM_OOB` | global 地址越界 |
 | 5 | `BAR_INCOMPLETE` | `BAR` 时 `M` 不是完整 mask |
 | 6 | `PC_OOB` | 取指超出 IMEM |
+| 7 | `BAD_LAUNCH` | 启动参数非法：`BLOCK_DIM` 为 0、超过 `SK_NUM_LANES × SK_NUM_WARPS`，或不是 `SK_NUM_LANES` 的整数倍 |
 
 ### 5.6 Kernel 调用约定
 
@@ -248,29 +297,30 @@ shared 和 global 不统一编址：指令本身决定访问哪个空间。访�
 | 偏移 | 名称 | 含义 |
 |---|---|---|
 | `0x00` | `CTRL` | bit0=start，bit1=done(只读)，bit2=idle(只读)，bit3=error(只读) |
-| `0x08` | `GRID_DIM` | block 数（v0.1 固定 1） |
-| `0x10` | `BLOCK_DIM` | 每 block 线程数（≤ `SK_NUM_LANES × SK_NUM_WARPS`） |
+| `0x08` | `GRID_DIM` | block 数；硬件按 block 顺序执行，kernel 用 `S_BID` 取当前索引 |
+| `0x10` | `BLOCK_DIM` | `blockDim.x`（主机写）：`1 ≤ x ≤ SK_NUM_LANES × SK_NUM_WARPS` 且是 `SK_NUM_LANES` 的整数倍；start 时校验，非法则 `STATUS = BAD_LAUNCH` |
 | `0x18/0x20/0x28` | `PTR_A/B/C` | 设备端 global 地址 |
 | `0x30/0x38/0x40` | `ARG0/1/2` | 标量参数（如 `n`） |
 | `0x48/0x50/0x58` | `IMEM_ADDR/WDATA/WE` | 指令镜像装载口 |
 
-启动顺序：主机写 IMEM 镜像 → 写参数 → 置 start → 轮询 done/error。入口固定 `0x0000`。
+启动顺序：主机写 IMEM 镜像 → 写参数（`GRID_DIM`/`BLOCK_DIM`/`PTR_*`/`ARG*`）→ 置
+start → 轮询 done/error。入口固定 `0x0000`。
 
 ### 5.7 汇编示例：vecadd
 
-`S_TID` 是 block 内的全局线程号（`wid * NTID + laneid`），`S_LANEID` 是 lane 在
-warp 内的编号。handwritten 部分：
+`S_TID` 是 block 内的线程号（`wid * WARPSZ + laneid`），`S_LANEID` 是 lane 在 warp 内的
+编号。`S_BLOCK_DIM` 就是 `blockDim.x`，kernel 认领工作直接拿 `BLOCK_DIM` 当 stride，
+不用自己乘 `NWARP × WARPSZ`。handwritten 部分：
 
 ```asm
-        ; PTR_A/B/C、ARG0、NTID/NWARP/WID 每条 lane 读出的值相同；TID 每条 lane 不同
+        ; PTR_A/B/C、ARG0、BLOCK_DIM/NWARP/WARPSZ/WID 每条 lane 读出的值相同；TID 每 lane 不同
         SREAD   r1, S_PTR_A
         SREAD   r2, S_PTR_B
         SREAD   r3, S_PTR_C
         SREAD   r4, S_ARG0          ; n
-        SREAD   r5, S_NWARP
-        SREAD   r6, S_NTID
-        SREAD   r11, S_TID          ; i = wid * NTID + laneid
-        MUL     r9, r5, r6          ; stride = NWARP * NTID（每条 lane 冗余计算）
+        SREAD   r6, S_BLOCK_DIM     ; stride = blockDim.x
+        SREAD   r11, S_TID          ; i = wid * WARPSZ + laneid
+        MOV     r9, r6              ; 每条 lane 冗余计算
 ```
 
 循环在源码里就是这段手写的 mask 序列（`sim/kernels/vecadd.s` 的内容，`r24` 是循环外的
@@ -312,8 +362,8 @@ done:
   `JMP` 无条件跳转；v0.1 的分支条件只有零/非零两种。
 - per-lane 条件先写谓词，再由 mask 指令组合进 mask；mask 变窄意味着"这些 lane
   暂时不参与"，mask 恢复意味着重聚。
-- `.P` 类 mask 指令的结果由硬件强制与当前 `M` 相干（`rd = ... & M`），防止
-  inactive lane 的旧谓词把 lane 复活。
+- `.P`/`.PM` 类 mask 指令把谓词按 `p & M` 读，之后再做普通位运算：inactive lane 的
+  旧谓词不会把 lane 复活；结果也不强制 ⊆ `M`，要交集就显式把当前 mask 当 `ra`。
 - 汇编器不认识结构化语法：`IF/LOOP/break/continue` 只是写 kernel 时的思路，落到源码
   里就是 mask 指令加统一分支。下面几节给的是手写模板，抄就行。
 
@@ -337,8 +387,8 @@ done:
 
 三个要点：
 
-- 两条分支 mask 必须在 `MREST` 之前算出来。`.P` 形式带着 `& M`，一旦先切到 `r25`，
-  `MANDN.P r26, r24, p` 就会被 `& r25` 清成空集。
+- 两条分支 mask 都在切 `M` 之前算，读的是同一个入口 `M`（顺序现在不敏感，`.P` 不再
+  对结果 `& M`，但放一起更清楚）。
 - merge 用 `MOR` 合并两条路径的**退出 mask**，不是直接 `MREST r24`。这样路径里的
   `break/continue` 收窄的 lane 不会在 merge 点被复活。
 - 没有 `ELSE` 时 else 路径什么都没做，它的退出 mask 就是 `r26` 本身，省一条 `MSAVE`。
@@ -352,8 +402,7 @@ done:
 L_head:
         MREST     r25                 ; M = 仍在循环里的 lane
         CMP.cond  p, ra, rb
-        MAND.P    r25, r25, p         ; 收窄：条件不成立的 lane 退出循环
-        MREST     r25                 ; M = 收窄后的 mask
+        MAND.PM   r25, r25, p         ; 收窄继续 mask，同时把 M 切过去
         BRZ       r25, L_done         ; 统一分支：没有 lane 继续就退出
         <body>
 L_latch:
@@ -363,25 +412,25 @@ L_done:
         MREST     r24                 ; 重聚：恢复进入循环时的 mask
 ```
 
+`MAND.PM` 只是省掉紧跟的 `MREST r25`：不想动 `M` 的话，写 `MAND.P r25, r25, p` 再
+补一条 `MREST r25` 效果一样。
+
 循环是 while 语义：`continue` 跳过本轮剩余部分（包括写在 body 末尾的自增），
 下一轮从头部条件重新开始。头部收窄 `r25` 是永久性的——这些 lane 已经算出
 "不必再迭代"，只有 `L_done` 的 `MREST r24` 才把它们放回来。
 
 ### 6.4 break/continue 序列
 
-`break`（`q` 是 break 条件谓词，`r5` 是临时 mask 寄存器）：
+`break`（`q` 是 break 条件谓词）：
 
 ```asm
         CMP.cond  q, ra, rb
-        MSAVE     r5                  ; 当前活跃 lane（r5 是临时数据寄存器，别和 kernel 的撞）
-        MAND.P    r5, r5, q           ; 其中满足 break 条件的
-        MANDN     r25, r25, r5        ; 这些 lane 永久退出循环
+        MANDN.P   r25, r25, q         ; 这些 lane 永久退出循环（只在当前 M 内生效）
         MCLR.P    q                   ; 本迭代剩余部分不再执行
 ```
 
-不能直接写 `MANDN.P r25, r25, q`：`.P` 形式会 `& M`，而 `M` 往往比 `r25` 窄（比如
-break 写在 `IF` 的 then 路径里），那样会把 else 路径的 lane 也从循环里删掉。所以先用
-`MSAVE`+`MAND.P` 组合出"正在退出"的 lane 集合，再用不带 `.P` 的 `MANDN` 减掉。
+`MANDN.P` 的谓词按 `q & M` 读，而 `M` 往往比 `r25` 窄（比如 break 写在 `IF` 的 then
+路径里）：`M` 外的 lane（else 路径）不会被误删，`r25` 里它们的那一位会留着。
 
 `continue`（`q` 是 continue 条件谓词）：
 
@@ -409,6 +458,10 @@ break 的 lane 已经不在 `r25` 里，直到 `L_done` 的 `MREST r24` 才回�
   `BAR_INCOMPLETE`。汇编器不做这个静态检查。
 - `EXIT` 是 warp 级指令，执行到就结束整条 warp；不要求 `M` 是完整 mask。
 - mask 指令是 warp 级操作，不受 `M` 门控；普通 ALU/访存同时受 `M` 和 `@p` 门控。
+- mask 指令的 GPR 操作数（`MREST` 的 `rs`，`MMOV/MNOT/MAND/MANDN/MOR` 的 `ra`/`rb`，
+  `.P`/`.PM` 的 `ra`）必须是 warp 一致的 mask 值——这是 ISA 的要求，但**硬件不查**；
+  黄金模型会查，不一致就报出 PC、指令和出错的 lane 值。这是模型侧的调试检查，
+  用来抓"每条 lane 各自一套 mask"的写法错误，不是硬件行为。
 - 不要随便跳进/跳出 mask 区域：标签在映像里就是地址，跳错了没有编译错误，只有跑飞。
 
 ## 7. 流水线
@@ -420,7 +473,7 @@ v0.1 采用 5 级流水线；lane 数取 8 时可以在 S3/S4 之间加一级操
 | S1 Schedule | 轮询选 warp、发出 PC |
 | S2 Fetch | 从 IMEM 取指 |
 | S3 Decode | 译码、读寄存器和谓词；统一分支在这里解析（GPR 里的 mask 值已知） |
-| S4 Execute | ALU / LSU / mask 指令；LDG 发出后由 scoreboard 跟踪 |
+| S4 Execute | ALU / LSU / mask / `SHFL`（lane 交换网络）/ `VOTE`（OR/AND 树）；LDG 发出后由 scoreboard 跟踪 |
 | S5 Commit | 受 `M` 和谓词门控写回；分支重定向、清年轻指令 |
 
 不预测分支：统一分支在 S3 解析，命中则重定向并清掉年轻指令；解析前该 warp 停止
@@ -431,7 +484,7 @@ v0.1 采用 5 级流水线；lane 数取 8 时可以在 S3/S4 之间加一级操
 
 | 存储 | 实现 | 说明 |
 |---|---|---|
-| 通用寄存器堆 | 每 lane 32×32b LUTRAM（2 读 1 写） | 不用 BRAM；8 lane × 4 warp 约 32 Kb |
+| 通用寄存器堆 | 每 lane 32×32b LUTRAM（3 读 1 写） | 不用 BRAM；`FMA` 的 `rd` 既读又写，所以是 3 读 |
 | mask 单元 | `M`（N 位 FF）+ mask 指令 | 保存的 mask 值占 GPR；`M` 是唯一的硬件 mask 状态 |
 | IMEM | BRAM，16 KB | 主机通过 AXI-Lite 装载，取指只从这里 |
 | shared memory | BRAM，多 bank，默认 32 KB | `LDS/STS`；bank 数 ≥ lane 数，冲突 replay |
@@ -467,6 +520,8 @@ GPU 顶层做成标准 Vitis RTL kernel：
   靠代码审查和硬件运行时兜底。
 - 掩码寄存器组只有 8 个：更深的嵌套要不要溢出到 shared、怎么溢出（软件阶段再定）。
 - 是否需要 mask 零/非零之外的统一分支条件（v0.1 先不做，需要时再加指令）。
+- `SHFL.IDX` 的取模：v0.1 的 `WARPSZ` 是 4/8（2 的幂），硬件用低位掩码就够；将来
+  `WARPSZ` 不是 2 的幂时要真取模（比较链或除法器）。
 - `SK_NUM_LANES` 取 4 还是 8（综合实验定）。
 - IMEM 16 KB、shared 32 KB 是否够用；shared bank 数取 lane 数还是 2×lane 数。
 - scoreboard 需要多少个 outstanding slot。
@@ -492,10 +547,10 @@ GPU 顶层做成标准 Vitis RTL kernel：
 
 分支只做 warp 级统一判断，v0.1 只有 mask 零/非零两种条件加无条件跳转；per-lane
 条件只写谓词、只更新 mask。保存的 mask 值放在 GPR 里（全 lane 同一副本，由汇编器
-分配和复用）；硬件只有执行 mask `M`，`.P` 类 mask 指令的结果由硬件强制与 `M` 相干
-（`rd = ... & M`）。重汇聚由汇编器在 merge 点显式 `MREST`，循环用 mask 收窄 +
-"已退出 lane"掩码处理 `break/continue`；`break/continue` 的支持范围由汇编器/语言
-决定，硬件不限制。`BAR` 要求完整 mask。
+分配和复用）；硬件只有执行 mask `M`，`.P`/`.PM` 类 mask 指令把谓词按 `p & M` 读、
+之后做普通位运算（结果不强制 ⊆ `M`，`.PM` 还同拍写 `M`）。重汇聚由汇编器在 merge
+点显式 `MREST`，循环用 mask 收窄 + "已退出 lane"掩码处理 `break/continue`；
+`break/continue` 的支持范围由汇编器/语言决定，硬件不限制。`BAR` 要求完整 mask。
 
 **好处**：硬件非常简单——没有重聚栈、没有重聚比较器、没有栈深限制、分支在译码级
 就能解析；分歧的正确性主要落在生成出来的 mask 序列上，硬件可以做成一组很简单的
@@ -508,8 +563,9 @@ GPU 顶层做成标准 Vitis RTL kernel：
 
 具体做法（P0）：汇编器只做编码（`sim/src/asm.rs`，一行一条指令）；掩码序列按 §6 的
 模板手写。`IF` 的 merge 用两条路径退出 mask 的 `MOR`，这样路径里的 break/continue
-收窄不会被 merge 撤销。`.P` 形式的 `& M` 是坑：从比 `M` 宽的外层 mask 里删 lane 必须
-绕开 `.P`（见 §6.4）。
+收窄不会被 merge 撤销。`.P` 的 `M` 只作用在谓词上（`p & M`），所以从比 `M` 宽的外层
+mask 里删 lane 可以直接写（见 §6.4）；要交集就显式把当前 mask 当 `ra`。`M` 的写入者
+是 `MREST`、`MCLR.P` 和 `.PM`。
 
 ### 12.4 两个地址空间、独立 load/store
 
@@ -519,7 +575,7 @@ shared memory（`LDS/STS`，16 位地址，片上 BRAM 多 bank）和 global mem
 
 ### 12.5 寄存器堆用 LUTRAM，不用 BRAM
 
-寄存器堆需要每 lane 2 读 1 写、组合读，BRAM 的端口数、延迟和粒度都不合适；
+寄存器堆需要每 lane 3 读 1 写、组合读，BRAM 的端口数、延迟和粒度都不合适；
 LUTRAM/FF 阵列更匹配，也更容易随 lane 数扩展。BRAM 留给 shared memory、IMEM
 和以后的 cache。
 
@@ -538,3 +594,57 @@ v0.1–P4 只用 shared memory + 简单 AXI；P5 再做 coalescer、多 bank 和
 Vitis RTL kernel + XRT 是 Xilinx 官方支持的上板路线，平台、shell 和驱动都有正式
 发布包，不需要自己维护平台。代价是 GPU 顶层必须符合 AXI-Lite 控制 + AXI4 主 +
 `ap_ctrl` 的约定（见 §9）。
+
+### 12.9 谓词门控对齐 NV 风格：`@!p` + `CMP` 组合修饰
+
+- `func` 从 7 位收到 4 位（每组最多 16 个编码）；省出的 bit29 做 `pinv`（`@!p`），
+  bit31:30 保留。
+- R/SR 格式有取反位，RI 没有（立即数 + pred 已经占满）：汇编器对 RI 上的 `@!p` 直接
+  报错，要取反就写互补条件（`GE`↔`LT`、`NE`↔`EQ`、`GEU`↔`LTU`）。
+- RI 维持 12 位立即数、**不**为了 `@!p` 收缩到 11 位（`ORI` 会够不到 bit11，`LI` 的
+  三段拼装也得跟着改）：RI 上只支持 `@p`。
+- `CMP` 的 `AND/OR/XOR` 修饰用**主操作码的子码**区分（类 `00` 的 `0100`–`0111`，
+  `bop = op[1:0]`）：4 位 `func` 装不下 6 个条件 × 4 种修饰，而子码段还有空位。
+- 好处：取反不占谓词号、写 kernel 少一条 `CMP`+`MANDN` 的绕行；硬件只多一个位和一条
+  读改写路径。代价：子码多花 3 个；RI 上的 `@!p` 要用互补条件。
+- 主操作码按"类 + 子码"重排（[§5.3](#53-编码格式)）：`op[5:4]` = 类、`op[3:0]` = 子码，
+  新指令只在段内分配。`func` 的价值在于"同一段里的变体"（ALU 的 13 种、条件码、mask 的
+  11 种），主操作码的类只回答"用哪个执行单元、什么格式"。
+- 执行模型同步对齐 CUDA：`GRID_DIM` 生效、block 之间串行、新增只读 `S_BID`；`BLOCK_DIM`
+  （主机写）就是 `blockDim.x`、`WARPSZ` 就是 `warpSize`、`BID` = `blockIdx`、
+  `TID` = `threadIdx`。`BLOCK_DIM` 必须是 `WARPSZ` 的整数倍，不支持部分 warp，
+  所以 `full` mask 仍然是常量、`BAR` 规则不变。
+
+### 12.10 warp 协作指令：`SHFL` + `VOTE`
+
+- `SHFL.IDX/UP/DOWN/BFLY` 做 warp 内 lane 间传值，`VOTE.ANY/ALL` 做谓词投票；两者都在
+  R 格式里（`func` 选模式），不动访存和掩码单元。
+- 修订 §5.1、§5.4 里"不提供 warp 级归约指令"的说法：改成"不提供 warp 级**数据**归约
+  指令；归约由软件用 `SHFL.*` 按 log N 步搭"。理由：没有统一通路、warp 只有 4 条，
+  走 shared 归约要两次全块同步；代价是执行级多一个 N×N lane 交换网络（N = 4 是每 lane
+  一个 4:1 mux、N = 8 是 8:1），面积和时序压力随 N² 长，所以这条只在 `WARPSZ ≤ 8` 时
+  划算，要综合实验（见 §12.6、§11）。
+- `VOTE` 的结果落在 **GPR**（0/1、写所有 lane）而不是谓词：本 ISA 的统一分支
+  `BRZ/BRNZ` 读 GPR，这样投完票不用再搬一次就能分叉；写所有 lane 是为了 lane 0 不在
+  `M` 里时也能读到结果。硬件只是 `M & pred_word` 后面接一棵 OR/AND 树。
+- 落地阶段：P4（和 mask 控制流单元同一批，见 [plan.md](plan.md)）。
+
+## 13. 性能计数器
+
+计数器是 M3（IPC 曲线）和 M5（带宽/事务对比表）的数据来源，不改 ISA；黄金模型和 RTL
+用同一份指令分类，方便对拍。
+
+| 组 | 计数 | 用途 |
+|---|---|---|
+| 周期/发射 | `CYCLE`、`INST_ISSUED`、`INST_RETIRED`、`WARP_READY`、`BLOCKS_DONE` | IPC = `INST_RETIRED / CYCLE`；M3 用同一个 kernel 跑 `NWARP = 1/2/4` 各一遍画曲线 |
+| 停顿（互斥） | `STALL_FETCH`、`STALL_SCOREBOARD`、`STALL_BRANCH`、`STALL_LSU`、`STALL_BAR`、`STALL_NO_WARP` | 判断 IPC 低是缺 warp 还是访存卡住 |
+| shared | `LDS_TXN`、`STS_TXN`、`LDS_REPLAY` | bank 冲突的代价 |
+| global/AXI | `AXI_RD_TXN`、`AXI_WR_TXN`、`AXI_RD_BEATS`、`AXI_WR_BEATS`、`AXI_RD_BYTES`、`AXI_WR_BYTES`、`AXI_STALL`、`LDG_INFLIGHT_MAX` | M5 的对比表：开/关 coalescer 各一行 |
+
+- 黄金模型已经按分类统计指令条数（`skein-run --stats` 和 `--dump-state` 里的
+  `op_counts`），RTL 的 `INST_RETIRED` 分类要和它对得上——对不上就是 RTL 的 bug，这比
+  "结果正确"更早暴露吞吐问题。
+- RTL 侧：`SK_perf.sv` 放一组 32 位计数器，各流水级给 one-hot 事件；读出口复用
+  AXI-Lite（`PERF_ADDR`/`PERF_DATA` 一对寄存器，和 IMEM 装载口同一套），`CTRL.start`
+  清零、`done` 冻结。200 MHz 下 32 位要 20 s 才回绕，够用。
+- 落地阶段：`CYCLE`/`INST_*`/`STALL_*` 在 P3，`AXI_*` 在 P5（见 [plan.md](plan.md)）。

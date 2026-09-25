@@ -84,21 +84,25 @@ fn split_label(text: &str) -> (Option<String>, &str) {
     (None, text)
 }
 
-/// `LI rd, imm` 展开成 1–3 条指令；其他行原样收下。
+/// `LI rd, imm` 展开成 1–3 条指令（带谓词门控就一路带下去）；其他行原样收下。
 fn push_line(text: &str, line: usize, program: &mut Vec<(usize, String)>) -> Result<(), AsmError> {
     let normalized = text.replace(',', " ");
     let tokens: Vec<&str> = normalized.split_whitespace().collect();
-    if !tokens
+    let (gate, rest) = match tokens.first() {
+        Some(token) if token.starts_with('@') => (*token, &tokens[1..]),
+        _ => ("", &tokens[..]),
+    };
+    if !rest
         .first()
         .is_some_and(|token| token.eq_ignore_ascii_case("LI"))
     {
         program.push((line, text.to_string()));
         return Ok(());
     }
-    if tokens.len() != 3 {
+    if rest.len() != 3 {
         return Err(AsmError::new(line, "LI 用法：LI rd, imm"));
     }
-    let (rd, text_imm) = (tokens[1], tokens[2]);
+    let (rd, text_imm) = (rest[1], rest[2]);
     let value = parse_imm(text_imm, line)?;
     if !(-(1i64 << 31)..=(1i64 << 32) - 1).contains(&value) {
         return Err(AsmError::new(
@@ -108,7 +112,7 @@ fn push_line(text: &str, line: usize, program: &mut Vec<(usize, String)>) -> Res
     }
     let imm = value as u32;
     if imm <= 0x7FF || imm >= 0xFFFF_F800 {
-        program.push((line, format!("ADDI {rd}, r0, {}", imm as i32)));
+        program.push((line, format!("{gate} ADDI {rd}, r0, {}", imm as i32)));
         return Ok(());
     }
     // 三段拼：LUI 放 bits31:20，LUM 放 bits23:12，ORI 放 bits11:0
@@ -124,7 +128,7 @@ fn push_line(text: &str, line: usize, program: &mut Vec<(usize, String)>) -> Res
     }
     for (step, (mnem, part)) in steps.iter().enumerate() {
         let source = if step == 0 { "r0" } else { rd };
-        program.push((line, format!("{mnem} {rd}, {source}, {part}")));
+        program.push((line, format!("{gate} {mnem} {rd}, {source}, {part}")));
     }
     Ok(())
 }
@@ -145,9 +149,17 @@ fn encode(
         return Err(AsmError::new(line, "空指令"));
     }
     let mut position = 0;
-    let mut gate = 0;
+    let mut gate = Gate::NONE;
     if tokens[0].starts_with('@') {
-        gate = pred_field(parse_pred(tokens[0].trim_start_matches('@'), line)?);
+        let text = tokens[0].trim_start_matches('@');
+        let (invert, name) = match text.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, text),
+        };
+        gate = Gate {
+            field: pred_field(parse_pred(name, line)?),
+            invert,
+        };
         position += 1;
     }
     if position >= tokens.len() {
@@ -160,7 +172,7 @@ fn encode(
 fn encode_insn(
     mnem: &str,
     args: &[&str],
-    gate: u32,
+    gate: Gate,
     labels: &BTreeMap<String, usize>,
     index: usize,
     line: usize,
@@ -187,18 +199,20 @@ fn encode_insn(
             op.code(),
         ));
     }
-    if let Some(cond) = mnem.strip_prefix("CMP.").and_then(Cmp::from_text) {
+    if let Some(rest) = mnem.strip_prefix("CMP.") {
+        let (cond, bop) = parse_cmp_suffix(rest, mnem, line)?;
         let (pd, ra, rb) = expect3(args, mnem, line)?;
         return Ok(enc_r(
-            OP_CMP,
+            bop.code(),
             parse_pred(pd, line)?,
             parse_reg(ra, line)?,
             parse_reg(rb, line)?,
-            0,
+            gate,
             cond.code(),
         ));
     }
     if mnem == "SEL" {
+        reject_gate(gate, mnem, line)?;
         if args.len() != 4 {
             return Err(AsmError::new(
                 line,
@@ -210,11 +224,42 @@ fn encode_insn(
             parse_reg(args[0], line)?,
             parse_reg(args[1], line)?,
             parse_reg(args[2], line)?,
-            pred_field(parse_pred(args[3], line)?),
+            Gate {
+                field: pred_field(parse_pred(args[3], line)?),
+                invert: false,
+            },
             0,
         ));
     }
+    if let Some(mode_text) = mnem.strip_prefix("SHFL.") {
+        let mode = Shfl::from_text(mode_text)
+            .ok_or_else(|| AsmError::new(line, format!("不认识的 SHFL 模式：{mnem}")))?;
+        let (rd, ra, rb) = expect3(args, mnem, line)?;
+        return Ok(enc_r(
+            OP_SHFL,
+            parse_reg(rd, line)?,
+            parse_reg(ra, line)?,
+            parse_reg(rb, line)?,
+            gate,
+            mode.code(),
+        ));
+    }
+    if let Some(mode_text) = mnem.strip_prefix("VOTE.") {
+        reject_gate(gate, mnem, line)?;
+        let mode = Vote::from_text(mode_text)
+            .ok_or_else(|| AsmError::new(line, format!("不认识的 VOTE 模式：{mnem}")))?;
+        let (rd, pd) = expect2(args, mnem, line)?;
+        return Ok(enc_r(
+            OP_VOTE,
+            parse_reg(rd, line)?,
+            0,
+            parse_pred(pd, line)?,
+            Gate::NONE,
+            mode.code(),
+        ));
+    }
     if let Some(op) = ri_opcode(mnem) {
+        reject_invert(gate, mnem, line)?;
         match mnem {
             "ADDI" | "SLTI" => {
                 let (rd, ra, imm) = expect3(args, mnem, line)?;
@@ -282,18 +327,40 @@ fn encode_insn(
         }
     }
     if let Some(op) = MaskOp::from_text(mnem) {
+        reject_gate(gate, mnem, line)?;
         return match op {
             MaskOp::Msave => {
                 let (rd,) = expect1(args, mnem, line)?;
-                Ok(enc_r(OP_MASK, parse_reg(rd, line)?, 0, 0, 0, op.code()))
+                Ok(enc_r(
+                    OP_MASK,
+                    parse_reg(rd, line)?,
+                    0,
+                    0,
+                    Gate::NONE,
+                    op.code(),
+                ))
             }
             MaskOp::Mrest => {
                 let (ra,) = expect1(args, mnem, line)?;
-                Ok(enc_r(OP_MASK, 0, parse_reg(ra, line)?, 0, 0, op.code()))
+                Ok(enc_r(
+                    OP_MASK,
+                    0,
+                    parse_reg(ra, line)?,
+                    0,
+                    Gate::NONE,
+                    op.code(),
+                ))
             }
             MaskOp::MclrP => {
                 let (pd,) = expect1(args, mnem, line)?;
-                Ok(enc_r(OP_MASK, 0, 0, parse_pred(pd, line)?, 0, op.code()))
+                Ok(enc_r(
+                    OP_MASK,
+                    0,
+                    0,
+                    parse_pred(pd, line)?,
+                    Gate::NONE,
+                    op.code(),
+                ))
             }
             op if op.is_predicated() => {
                 let (rd, ra, pd) = expect3(args, mnem, line)?;
@@ -302,7 +369,7 @@ fn encode_insn(
                     parse_reg(rd, line)?,
                     parse_reg(ra, line)?,
                     parse_pred(pd, line)?,
-                    0,
+                    Gate::NONE,
                     op.code(),
                 ))
             }
@@ -313,7 +380,7 @@ fn encode_insn(
                     parse_reg(rd, line)?,
                     parse_reg(ra, line)?,
                     parse_reg(rb, line)?,
-                    0,
+                    Gate::NONE,
                     op.code(),
                 ))
             }
@@ -324,7 +391,7 @@ fn encode_insn(
                     parse_reg(rd, line)?,
                     parse_reg(ra, line)?,
                     0,
-                    0,
+                    Gate::NONE,
                     op.code(),
                 ))
             }
@@ -332,12 +399,14 @@ fn encode_insn(
     }
     match mnem {
         "BRZ" | "BRNZ" => {
+            reject_gate(gate, mnem, line)?;
             let (rs, target) = expect2(args, mnem, line)?;
             let offset = target_offset(target, labels, index, line, 21)?;
             let op = if mnem == "BRZ" { OP_BRZ } else { OP_BRNZ };
             return Ok(enc_br(op, parse_reg(rs, line)?, offset));
         }
         "JMP" => {
+            reject_gate(gate, mnem, line)?;
             let (target,) = expect1(args, mnem, line)?;
             let offset = target_offset(target, labels, index, line, 26)?;
             return Ok(enc_j(OP_JMP, offset));
@@ -348,11 +417,12 @@ fn encode_insn(
             let name = name.strip_prefix("S_").unwrap_or(&name).to_string();
             let sreg = Sreg::from_text(&name)
                 .ok_or_else(|| AsmError::new(line, format!("不认识的特殊寄存器：{sreg}")))?;
-            return Ok(enc_sread(parse_reg(rd, line)?, sreg.code()));
+            return Ok(enc_sr(parse_reg(rd, line)?, sreg.code(), gate));
         }
         _ => {}
     }
     if let Some(op) = Sys::from_text(mnem) {
+        reject_gate(gate, mnem, line)?;
         if !args.is_empty() {
             return Err(AsmError::new(line, format!("{mnem} 不需要操作数")));
         }
@@ -376,6 +446,58 @@ fn ri_opcode(mnem: &str) -> Option<u32> {
         "STG" => OP_STG,
         _ => return None,
     })
+}
+
+/// `CMP.<cond>[.<AND|OR|XOR>]` 的后缀。
+fn parse_cmp_suffix(rest: &str, mnem: &str, line: usize) -> Result<(Cmp, Bop), AsmError> {
+    let mut parts = rest.split('.');
+    let cond = parts
+        .next()
+        .and_then(Cmp::from_text)
+        .ok_or_else(|| AsmError::new(line, format!("不认识的条件：{mnem}")))?;
+    let bop = match parts.next() {
+        None => Bop::Set,
+        Some("") => {
+            return Err(AsmError::new(
+                line,
+                format!("组合修饰写法应为 CMP.<cond>.AND/.OR/.XOR：{mnem}"),
+            ))
+        }
+        Some(text) => Bop::from_text(text).ok_or_else(|| {
+            AsmError::new(line, format!("不认识的组合修饰（只有 AND/OR/XOR）：{mnem}"))
+        })?,
+    };
+    if parts.next().is_some() {
+        return Err(AsmError::new(
+            line,
+            format!("CMP 最多带一个组合修饰：{mnem}"),
+        ));
+    }
+    Ok((cond, bop))
+}
+
+/// 格式里没有 pred 字段的指令不接受 `@p`。
+fn reject_gate(gate: Gate, mnem: &str, line: usize) -> Result<(), AsmError> {
+    if gate.is_none() {
+        Ok(())
+    } else {
+        Err(AsmError::new(
+            line,
+            format!("{mnem} 不支持谓词门控（格式里没有 pred 字段）"),
+        ))
+    }
+}
+
+/// RI 格式没有取反位：`@!p` 必须报错，不能当成 `@p` 用。
+fn reject_invert(gate: Gate, mnem: &str, line: usize) -> Result<(), AsmError> {
+    if gate.invert {
+        Err(AsmError::new(
+            line,
+            format!("{mnem} 是 RI 格式、没有谓词取反位（用相反的比较条件代替）"),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn expect1<'a>(args: &[&'a str], mnem: &str, line: usize) -> Result<(&'a str,), AsmError> {

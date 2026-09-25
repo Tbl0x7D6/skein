@@ -25,8 +25,12 @@ pub enum Space {
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub ntid: usize,
+    /// warpSize：每个 warp 的 lane 数（对应 `S_WARPSZ`，硬件上是 `SK_NUM_LANES`）。
+    pub warpsz: usize,
+    /// warp 数（硬件容量）。
     pub nwarp: usize,
+    /// `blockDim.x`：主机给的 block 线程数。`None` = 用满容量 `nwarp * warpsz`。
+    pub block_dim: Option<usize>,
     pub grid: u32,
     pub smem_bytes: usize,
     pub gmem_bytes: usize,
@@ -38,8 +42,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            ntid: NUM_LANES,
+            warpsz: NUM_LANES,
             nwarp: NUM_WARPS,
+            block_dim: None,
             grid: 1,
             smem_bytes: 32 * 1024,
             gmem_bytes: 1 << 20,
@@ -80,11 +85,18 @@ pub struct Machine {
     pub status: Status,
     pub steps: u64,
     pub barriers: u64,
+    /// 各分类的指令条数（性能计数用，见 docs/design.md §13）。
+    counts: Vec<u64>,
     /// 模拟器的死循环保护被触发（不是硬件状态）。
     pub limit_hit: bool,
-    ntid: usize,
+    /// warpSize（`S_WARPSZ`）。
+    warpsz: usize,
     nwarp: usize,
+    /// 主机给的 block 线程数（`S_BLOCK_DIM`），已解析成具体值。
+    block_dim: usize,
     grid: u32,
+    /// 当前正在跑的 block 索引（`S_BID`）。
+    bid: u32,
     smem: Vec<u8>,
     gmem: Vec<u8>,
     sregs: Vec<(Sreg, u32)>,
@@ -94,11 +106,11 @@ pub struct Machine {
 
 impl Machine {
     pub fn new(imem: Vec<u32>, config: Config) -> Machine {
-        // warp 的完整 mask 由 ntid 决定（32 位是上限）
-        let full = if config.ntid >= 32 {
+        // warp 的完整 mask 由 warpSize 决定（32 位是上限）；没有部分 warp
+        let full = if config.warpsz >= 32 {
             u32::MAX
         } else {
-            (1u32 << config.ntid) - 1
+            (1u32 << config.warpsz) - 1
         };
         let warps = (0..config.nwarp)
             .map(|wid| Warp {
@@ -106,8 +118,8 @@ impl Machine {
                 pc: 0,
                 m: full,
                 full,
-                gpr: vec![[0; NUM_GPR]; config.ntid],
-                pred: vec![[false; NUM_PRED]; config.ntid],
+                gpr: vec![[0; NUM_GPR]; config.warpsz],
+                pred: vec![[false; NUM_PRED]; config.warpsz],
                 state: WarpState::Run,
             })
             .collect();
@@ -117,10 +129,13 @@ impl Machine {
             status: Status::Ok,
             steps: 0,
             barriers: 0,
+            counts: vec![0; OpClass::ALL.len()],
             limit_hit: false,
-            ntid: config.ntid,
+            warpsz: config.warpsz,
             nwarp: config.nwarp,
+            block_dim: config.block_dim.unwrap_or(config.nwarp * config.warpsz),
             grid: config.grid,
+            bid: 0,
             smem: vec![0; config.smem_bytes],
             gmem: vec![0; config.gmem_bytes],
             sregs: config.sregs,
@@ -155,9 +170,62 @@ impl Machine {
         }
     }
 
+    // --- 性能计数（M3 的 IPC 曲线、M5 的带宽/事务表用）---
+
+    pub fn count(&self, class: OpClass) -> u64 {
+        self.counts[class.code() as usize]
+    }
+
+    pub fn op_counts(&self) -> impl Iterator<Item = (OpClass, u64)> + '_ {
+        OpClass::ALL
+            .iter()
+            .copied()
+            .map(|class| (class, self.count(class)))
+    }
+
     // --- 执行 ---
 
+    /// 启动参数检查：`1 ≤ BLOCK_DIM ≤ NWARP × WARPSZ`，且是 `WARPSZ` 的整数倍
+    /// （不允许部分 warp）。见 docs/design.md §5.6。
+    fn launch_error(&self) -> Option<Status> {
+        let capacity = self.nwarp * self.warpsz;
+        let bad = self.warpsz == 0
+            || self.block_dim == 0
+            || self.block_dim > capacity
+            || self.block_dim % self.warpsz != 0;
+        bad.then_some(Status::BadLaunch)
+    }
+
     pub fn run(&mut self) -> Status {
+        if let Some(status) = self.launch_error() {
+            self.fail(status);
+            return self.status;
+        }
+        let active_warps = self.block_dim / self.warpsz;
+        for block in 0..self.grid {
+            self.bid = block;
+            for warp in &mut self.warps {
+                warp.pc = 0;
+                warp.m = warp.full;
+                warp.gpr.fill([0; NUM_GPR]);
+                warp.pred.fill([false; NUM_PRED]);
+                // 只有 BLOCK_DIM / WARPSZ 条 warp 活跃，其余直接 done
+                warp.state = if warp.wid < active_warps {
+                    WarpState::Run
+                } else {
+                    WarpState::Done
+                };
+            }
+            self.run_block();
+            if self.status != Status::Ok || self.limit_hit {
+                break;
+            }
+        }
+        self.status
+    }
+
+    /// 跑一个 block：所有 warp 轮转执行到 EXIT；剩下还在 BAR 的 warp 一起放行。
+    fn run_block(&mut self) {
         while self.status == Status::Ok {
             let running: Vec<usize> = (0..self.warps.len())
                 .filter(|&wid| self.warps[wid].state == WarpState::Run)
@@ -182,7 +250,6 @@ impl Machine {
                 }
             }
         }
-        self.status
     }
 
     fn step(&mut self, wid: usize) {
@@ -192,6 +259,9 @@ impl Machine {
         }
         let pc = self.warps[wid].pc;
         let insn = Insn::decode(self.imem[pc]);
+        if let Some(class) = op_class(insn.op) {
+            self.counts[class.code() as usize] += 1;
+        }
         self.warps[wid].pc += 1;
         self.steps += 1;
         if self.steps > self.max_steps {
@@ -206,7 +276,7 @@ impl Machine {
                 "w{wid} {pc:04x}  M={:0width$b}  {}",
                 self.warps[wid].m,
                 disasm(&insn, Some(pc)),
-                width = self.ntid
+                width = self.warpsz
             );
         }
         self.execute(wid, pc, &insn);
@@ -222,11 +292,12 @@ impl Machine {
     /// 受 `M` 和 `@p` 门控的活跃 lane；`SEL` 的 pred 字段是操作数，不是门控。
     fn lanes(&self, wid: usize, insn: &Insn, gate: bool) -> Vec<usize> {
         let index = if gate { insn.pred_index() } else { None };
+        let inverted = gate && insn.pred_inverted();
         let warp = &self.warps[wid];
-        (0..self.ntid)
+        (0..self.warpsz)
             .filter(|&lane| (warp.m >> lane) & 1 == 1)
             .filter(|&lane| match index {
-                Some(index) => warp.pred[lane][index as usize],
+                Some(index) => warp.pred[lane][index as usize] != inverted,
                 None => true,
             })
             .collect()
@@ -235,7 +306,7 @@ impl Machine {
     /// 每 lane 的谓词拼成一个 mask 值。
     fn pred_word(&self, wid: usize, index: u32) -> u32 {
         let mut word = 0;
-        for lane in 0..self.ntid {
+        for lane in 0..self.warpsz {
             if self.warps[wid].pred[lane][index as usize] {
                 word |= 1 << lane;
             }
@@ -246,12 +317,14 @@ impl Machine {
     /// 没设置过的参数寄存器读出 0（对应 AXI-Lite 控制寄存器的复位值）。
     fn read_sreg(&self, wid: usize, lane: usize, sreg: Sreg) -> u32 {
         match sreg {
-            Sreg::Tid => (self.warps[wid].wid * self.ntid + lane) as u32,
+            Sreg::Tid => (self.warps[wid].wid * self.warpsz + lane) as u32,
             Sreg::LaneId => lane as u32,
             Sreg::Wid => self.warps[wid].wid as u32,
-            Sreg::Ntid => self.ntid as u32,
+            Sreg::Warpsz => self.warpsz as u32,
             Sreg::Nwarp => self.nwarp as u32,
+            Sreg::BlockDim => self.block_dim as u32,
             Sreg::Grid => self.grid,
+            Sreg::Bid => self.bid,
             Sreg::Status => self.status.code(),
             other => self
                 .sregs
@@ -269,13 +342,14 @@ impl Machine {
                     return self.fail(Status::BadInsn);
                 };
                 for lane in self.lanes(wid, insn, true) {
+                    let acc = self.warps[wid].gpr[lane][insn.rd as usize];
                     let a = self.warps[wid].gpr[lane][insn.ra as usize];
                     let b = self.warps[wid].gpr[lane][insn.rb as usize];
-                    self.warps[wid].gpr[lane][insn.rd as usize] = ralu_exec(op, a, b);
+                    self.warps[wid].gpr[lane][insn.rd as usize] = ralu_exec(op, acc, a, b);
                 }
             }
-            OP_CMP => {
-                let Some(cond) = Cmp::from_code(insn.func) else {
+            op if is_cmp_op(op) => {
+                let (Some(cond), Some(bop)) = (Cmp::from_code(insn.func), insn.bop()) else {
                     return self.fail(Status::BadInsn);
                 };
                 if insn.rd as usize >= NUM_PRED {
@@ -284,7 +358,14 @@ impl Machine {
                 for lane in self.lanes(wid, insn, true) {
                     let a = self.warps[wid].gpr[lane][insn.ra as usize];
                     let b = self.warps[wid].gpr[lane][insn.rb as usize];
-                    self.warps[wid].pred[lane][insn.rd as usize] = cmp_exec(cond, a, b);
+                    let value = cmp_exec(cond, a, b);
+                    let dest = &mut self.warps[wid].pred[lane][insn.rd as usize];
+                    *dest = match bop {
+                        Bop::Set => value,
+                        Bop::And => *dest & value,
+                        Bop::Or => *dest | value,
+                        Bop::Xor => *dest ^ value,
+                    };
                 }
             }
             OP_SEL => {
@@ -335,7 +416,7 @@ impl Machine {
                     self.write_word(space, addr, value);
                 }
             }
-            OP_MASK => self.mask_op(wid, insn),
+            OP_MASK => self.mask_op(wid, pc, insn),
             OP_BRZ | OP_BRNZ => {
                 let zero = self.warps[wid].gpr[0][insn.rs() as usize] == 0;
                 let taken = if insn.op == OP_BRZ { zero } else { !zero };
@@ -352,6 +433,52 @@ impl Machine {
                 };
                 for lane in self.lanes(wid, insn, true) {
                     let value = self.read_sreg(wid, lane, sreg);
+                    self.warps[wid].gpr[lane][insn.rd as usize] = value;
+                }
+            }
+            OP_SHFL => {
+                let Some(mode) = Shfl::from_code(insn.func) else {
+                    return self.fail(Status::BadInsn);
+                };
+                let lanes = self.lanes(wid, insn, true);
+                let n = self.warpsz;
+                let m = self.warps[wid].m;
+                let (rd, rb) = (insn.rd as usize, insn.rb as usize);
+                // 先快照所有 lane 的源值：写回不能影响同一拍的其他 lane
+                let source: Vec<u32> = (0..n)
+                    .map(|lane| self.warps[wid].gpr[lane][insn.ra as usize])
+                    .collect();
+                for lane in lanes {
+                    let delta = self.warps[wid].gpr[lane][rb] as usize;
+                    let src = match mode {
+                        Shfl::Idx => Some(delta % n),
+                        Shfl::Up => lane.checked_sub(delta),
+                        Shfl::Down => lane.checked_add(delta).filter(|src| *src < n),
+                        Shfl::Bfly => Some(lane ^ delta).filter(|src| *src < n),
+                    };
+                    // 越界或源 lane 不在 M 里：保持自己的值（对齐 NV）
+                    let value = match src {
+                        Some(src) if (m >> src) & 1 == 1 => source[src],
+                        _ => source[lane],
+                    };
+                    self.warps[wid].gpr[lane][rd] = value;
+                }
+            }
+            OP_VOTE => {
+                let Some(mode) = Vote::from_code(insn.func) else {
+                    return self.fail(Status::BadInsn);
+                };
+                if insn.rb as usize >= NUM_PRED {
+                    return self.fail(Status::BadInsn);
+                }
+                let pred = self.pred_word(wid, insn.rb);
+                let m = self.warps[wid].m;
+                let value = match mode {
+                    Vote::Any => u32::from(m & pred != 0),
+                    Vote::All => u32::from(m & !pred == 0),
+                };
+                // warp 级指令：结果写所有 lane，BRZ/BRNZ 读 lane 0 也拿得到
+                for lane in 0..self.warpsz {
                     self.warps[wid].gpr[lane][insn.rd as usize] = value;
                 }
             }
@@ -385,16 +512,36 @@ impl Machine {
         Some(addrs)
     }
 
-    fn mask_op(&mut self, wid: usize, insn: &Insn) {
+    /// mask 指令的 GPR 操作数必须全 lane 一致。硬件不查这一条，这是模型侧的调试检查
+    /// （见 docs/design.md §6.5）：mask 值由 MSAVE 广播、被 MREST 当输入，天生是 warp
+    /// 一致的，kernel 里出现"每条 lane 各自一套 mask"一定是写错了。返回 lane 0 的值。
+    fn uniform_gpr(&self, wid: usize, pc: usize, insn: &Insn, reg: u32) -> u32 {
+        let warp = &self.warps[wid];
+        let first = warp.gpr[0][reg as usize];
+        let odd: Vec<String> = (0..self.warpsz)
+            .filter(|&lane| warp.gpr[lane][reg as usize] != first)
+            .map(|lane| format!("lane{lane}={:#010x}", warp.gpr[lane][reg as usize]))
+            .collect();
+        assert!(
+            odd.is_empty(),
+            "w{wid} pc={pc:04x} {}：r{reg} 必须全 lane 一致，lane0={first:#010x}，{}",
+            disasm(insn, Some(pc)),
+            odd.join(" ")
+        );
+        first
+    }
+
+    fn mask_op(&mut self, wid: usize, pc: usize, insn: &Insn) {
         let Some(op) = MaskOp::from_code(insn.func) else {
             return self.fail(Status::BadInsn);
         };
         let full = self.warps[wid].full;
-        let (rd, ra, rb) = (insn.rd as usize, insn.ra as usize, insn.rb as usize);
+        let (rd, rb) = (insn.rd as usize, insn.rb as usize);
         let value = match op {
             MaskOp::Msave => self.warps[wid].m,
             MaskOp::Mrest => {
-                self.warps[wid].m = self.warps[wid].gpr[0][ra] & full;
+                let source = self.uniform_gpr(wid, pc, insn, insn.ra);
+                self.warps[wid].m = source & full;
                 return;
             }
             MaskOp::MclrP => {
@@ -404,28 +551,44 @@ impl Machine {
                 self.warps[wid].m = self.warps[wid].m & !self.pred_word(wid, rb as u32) & full;
                 return;
             }
-            MaskOp::Mmov => self.warps[wid].gpr[0][ra],
-            MaskOp::Mnot => !self.warps[wid].gpr[0][ra],
-            MaskOp::Mand => self.warps[wid].gpr[0][ra] & self.warps[wid].gpr[0][rb],
-            MaskOp::Mandn => self.warps[wid].gpr[0][ra] & !self.warps[wid].gpr[0][rb],
-            MaskOp::Mor => self.warps[wid].gpr[0][ra] | self.warps[wid].gpr[0][rb],
-            MaskOp::MandP | MaskOp::MandnP | MaskOp::MorP => {
+            MaskOp::Mmov => self.uniform_gpr(wid, pc, insn, insn.ra),
+            MaskOp::Mnot => !self.uniform_gpr(wid, pc, insn, insn.ra),
+            MaskOp::Mand => {
+                self.uniform_gpr(wid, pc, insn, insn.ra) & self.uniform_gpr(wid, pc, insn, insn.rb)
+            }
+            MaskOp::Mandn => {
+                self.uniform_gpr(wid, pc, insn, insn.ra) & !self.uniform_gpr(wid, pc, insn, insn.rb)
+            }
+            MaskOp::Mor => {
+                self.uniform_gpr(wid, pc, insn, insn.ra) | self.uniform_gpr(wid, pc, insn, insn.rb)
+            }
+            // `.P` / `.PM`：谓词按 `p & M` 读，之后是普通位运算；结果不再强制 ⊆ M，
+            // 要交集就显式把当前 mask 当 ra。
+            MaskOp::MandP
+            | MaskOp::MandnP
+            | MaskOp::MorP
+            | MaskOp::MandPm
+            | MaskOp::MandnPm
+            | MaskOp::MorPm => {
                 if rb >= NUM_PRED {
                     return self.fail(Status::BadInsn);
                 }
-                let pred = self.pred_word(wid, rb as u32);
-                let source = self.warps[wid].gpr[0][ra];
-                let m = self.warps[wid].m;
+                let pred = self.pred_word(wid, rb as u32) & self.warps[wid].m;
+                let source = self.uniform_gpr(wid, pc, insn, insn.ra);
                 match op {
-                    MaskOp::MandP => source & pred & m,
-                    MaskOp::MandnP => source & !pred & m,
-                    _ => (source | pred) & m,
+                    MaskOp::MandP | MaskOp::MandPm => source & pred,
+                    MaskOp::MandnP | MaskOp::MandnPm => source & !pred,
+                    _ => source | pred,
                 }
             }
         } & full;
-        // mask 指令是 warp 级操作，不受 M 门控
-        for lane in 0..self.ntid {
+        // mask 指令是 warp 级操作，不受 M 门控：写所有 lane
+        for lane in 0..self.warpsz {
             self.warps[wid].gpr[lane][rd] = value;
+        }
+        // `.PM`：rd 和 M 同拍更新（上面算结果时读的还是旧 M）
+        if op.writes_mask() {
+            self.warps[wid].m = value;
         }
     }
 
@@ -450,6 +613,15 @@ impl Machine {
         out.push_str(&format!("  \"status_name\": \"{}\",\n", self.status.text()));
         out.push_str(&format!("  \"steps\": {},\n", self.steps));
         out.push_str(&format!("  \"barriers\": {},\n", self.barriers));
+        out.push_str(&format!("  \"grid\": {},\n", self.grid));
+        out.push_str(&format!("  \"bid\": {},\n", self.bid));
+        out.push_str(&format!("  \"warpsz\": {},\n", self.warpsz));
+        out.push_str(&format!("  \"block_dim\": {},\n", self.block_dim));
+        let counts: Vec<String> = self
+            .op_counts()
+            .map(|(class, value)| format!("\"{}\": {value}", class.text()))
+            .collect();
+        out.push_str(&format!("  \"op_counts\": {{{}}},\n", counts.join(", ")));
         out.push_str("  \"warps\": [\n");
         for (index, warp) in self.warps.iter().enumerate() {
             out.push_str("    {\n");
@@ -498,7 +670,8 @@ fn oob_status(space: Space) -> Status {
     }
 }
 
-fn ralu_exec(op: Ralu, a: u32, b: u32) -> u32 {
+/// 执行 R 格式 ALU 指令；`acc` 是 `rd` 的旧值，只有 `FMA` 用得到。
+fn ralu_exec(op: Ralu, acc: u32, a: u32, b: u32) -> u32 {
     match op {
         Ralu::Add => a.wrapping_add(b),
         Ralu::Sub => a.wrapping_sub(b),
@@ -512,6 +685,7 @@ fn ralu_exec(op: Ralu, a: u32, b: u32) -> u32 {
         Ralu::Sltu => u32::from(a < b),
         Ralu::Mul => a.wrapping_mul(b),
         Ralu::Mov => a,
+        Ralu::Fma => acc.wrapping_add(a.wrapping_mul(b)),
     }
 }
 

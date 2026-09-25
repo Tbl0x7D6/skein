@@ -22,9 +22,9 @@
 
 **交付物**
 
-- 冻结 [design.md](design.md) §5 的编码：操作码表、`pred`/`func` 字段、立即数和
-  分支偏移宽度、保留编码、寄存器/谓词/mask 编号、`STATUS` 错误码。`sim/src/isa.rs`
-  是编码的唯一来源，汇编器和黄金模型都从它取定义。
+- 冻结 [design.md](design.md) §5 的编码：类 + 子码的主操作码段分配、`pred`/`func`
+  字段、立即数和分支偏移宽度、保留编码、寄存器/谓词/mask 编号、`STATUS` 错误码。
+  `sim/src/isa.rs` 是编码的唯一来源，汇编器和黄金模型都从它取定义。
 - `sim/src/asm.rs`：Rust 汇编器，编译成 `skein-asm`。
   - 只做翻译：一行一条指令（认标签、去注释、编码成 32 位字），唯一的伪指令是
     `LI rd, imm`（展开成 1–3 条 `ADDI`/`LUI`/`LUM`/`ORI`）。
@@ -33,18 +33,20 @@
     （`BAR` 由硬件在运行时兜底）。
   - 输出：IMEM 二进制镜像（每字 32 位小端）。
 - `sim/src/golden.rs`：黄金模型（`skein-run`）。per-lane 寄存器/谓词、执行 mask `M`、
-  保存 mask 的 GPR、统一分支、mask 指令、两个地址空间和错误码；支持 `--trace` 和
-  `--dump-state`（dump 里包含 `M` 和全部 GPR）。
+  保存 mask 的 GPR、统一分支、mask 指令、`SHFL`/`VOTE`、两个地址空间和错误码；支持
+  launch 形状（`GRID_DIM`/`BLOCK_DIM`，非法 `BLOCK_DIM` 在 start 时报 `BAD_LAUNCH`）；
+  支持 `--trace`、`--stats` 和 `--dump-state`（dump 里包含 `M`、全部 GPR 和 `op_counts`）。
 - `sim/tests/`：`cargo test` 跑的集成测试。
   - 定向 ISA 测试：每条指令至少一条，含错误码。
   - kernel 测试：手写的 mask 序列（`IF/ELSE` merge、循环收窄、continue、按 lane 的
-    break）和 `kernels/vecadd.s`，在黄金模型里逐 lane 比对。
+    break）、`kernels/vecadd.s`，以及 4 warp x 4 lane 协作搬 shared + `BAR` 的
+    `kernels/matmul.s`，都在黄金模型里逐 lane 比对。
 - 定稿 `SK_config.vh` 参数。
 
 **验收**：vecadd 在黄金模型里算出正确结果；kernel 测试全部通过；非法的指令和操作数
 被汇编器拒绝（控制流正确性靠模板、测试和代码审查）。
 
-**状态**：已完成（`make test` 跑 26 条 Rust 测试：21 条 ISA + 5 条 kernel；
+**状态**：已完成（`make test` 跑 48 条 Rust 测试：38 条 ISA + 10 条 kernel；
 `make asm` 出 `.bin`，`make sim` 用黄金模型跑）。
 
 ## P1 — 单 lane 最小核
@@ -54,7 +56,7 @@
 **交付物**
 
 - `rtl/lib/`：`SK_elastic_buffer.sv`、`SK_dp_ram.sv`、`SK_generic_arbiter.sv`。
-- `rtl/core/`：`SK_fetch.sv`、`SK_decode.sv`、`SK_regfile.sv`（LUTRAM，2 读 1 写）、
+- `rtl/core/`：`SK_fetch.sv`、`SK_decode.sv`、`SK_regfile.sv`（LUTRAM，3 读 1 写）、
   `SK_alu.sv`、`SK_lsu.sv`、`SK_branch.sv`（统一分支）、`SK_mask.sv`（1 位 mask 版本）、
   `SK_commit.sv`；`rtl/top/SK_core.sv`。
 - `rtl/mem/SK_imem.sv`：BRAM 指令存储，PC 取指；主机装载口到 P6 再接。
@@ -70,11 +72,11 @@
 
 **交付物**
 
-- 每 lane 一套寄存器堆（LUTRAM，2 读 1 写），加上操作数收集和写回分发。
+- 每 lane 一套寄存器堆（LUTRAM，3 读 1 写），加上操作数收集和写回分发。
 - `M` 门控：写回、访存、谓词写都受 `M`（和 `@p`）约束。
 - `CMP` 写谓词；`SEL` 和 `@p` 谓词化指令。
-- `SK_mask.sv` 支持 `M` 和 GPR 操作数的 mask 指令；`.P` 形式的结果硬件强制与
-  当前 `M` 相干。
+- `SK_mask.sv` 支持 `M` 和 GPR 操作数的 mask 指令；`.P`/`.PM` 的谓词按 `p & M` 读、
+  之后是普通位运算（结果不强制 ⊆ `M`），`.PM` 同拍写 `rd` 和 `M`。
 - lane 数参数化；做 4/8 lane 的综合实验（顺带记录 16 lane 的参考数据），
   记录 LUT、FF、Fmax，决定最终 lane 数。
 - vecadd（N lane）与黄金模型逐元素一致，进回归。
@@ -93,11 +95,12 @@
 - `SK_lsu.sv` 改为非阻塞：`LDG` 发出后 warp 让出流水线；`STG` posted write +
   outstanding 计数，内核结束前必须排空。
 - `rtl/sched/SK_bar_unit.sv`：块内屏障（只在完整 mask 下执行，汇编器负责检查）。
-- 性能计数器：每 warp 指令数、stall 周期数、mask 指令数。
+- 性能计数器：`CYCLE` / `INST_*` / `STALL_*` 一组，清单见
+  [design.md](design.md) §13；黄金模型的 `op_counts` 是 RTL 的对拍基准。
 
 **验收**：4 warp 并发跑 vecadd 结果正确；IPC > 0.5（单 warp 时应当 < 0.3）。
 
-## P4 — mask 控制流单元
+## P4 — mask 控制流单元 + warp 协作指令
 
 **目标**：把 §6 的手写 mask 序列真正跑起来，验证分支、部分 lane 退出循环和
 `break/continue`。
@@ -105,21 +108,29 @@
 **交付物**
 
 - `rtl/core/SK_mask.sv`：`M`（N 位）+ GPR 操作数的 mask 指令
-  （`MSAVE/MREST/MMOV/MAND/MANDN/MOR/MNOT/MAND.P/MANDN.P/MOR.P`）；
-  `.P` 结果硬件强制与 `M` 相干。
+  （`MSAVE/MREST/MMOV/MAND/MANDN/MOR/MNOT/MAND.P/MANDN.P/MOR.P/MCLR.P/
+  MAND.PM/MANDN.PM/MOR.PM`）；`.P`/`.PM` 只用 `M` 过滤谓词，`.PM` 同拍写 `M`。
 - 统一分支：`BRZ/BRNZ` 在译码级解析（GPR 里的 mask 值已知），`JMP` 无条件跳转。
 - kernel 集成：`kernels/` 里的手写 mask 程序直接生成可上板的 IMEM 镜像。
+- `SHFL.IDX/UP/DOWN/BFLY`：执行级的 N×N lane 交换网络（`src_lane` 由 `rb` 算，
+  越界或源 lane 不在 `M` 里时返回自己的值）。
+- `VOTE.ANY/ALL`：`M & pred_word` 后面的 OR/AND 树，结果写所有 lane 的 GPR，
+  直接接 `BRZ/BRNZ`。两者的语义见 [design.md](design.md) §5.4 和 §12.10。
 - 测试：
   - `IF/ELSE`、嵌套 `IF/ELSE`、无 `ELSE` 的 `IF`。
   - `LOOP`：部分 lane 在不同迭代退出；所有 lane 同一轮退出。
   - `break/continue`：最内层循环、嵌在 `IF/ELSE` 里的 `break/continue`；
-    终止型语句改变 continuation mask 的数据流。
+    终止型语句改变 continuation mask 的数据流；`break` 写在 `IF/ELSE` 的 then 里时
+    else 路径的 lane 不能被误删。
+  - `.PM`：`rd` 和 `M` 同拍更新，且用的是旧 `M`；结果被 `& full` 夹住。
+  - mask 指令的 GPR 操作数要求 warp 一致（模型侧检查，硬件不查）。
   - 汇编器静态检查（可选，见 P0 状态）：`BAR` 在收窄 mask 区域、跨层 `break/continue`、
     mask GPR 压力告警。
   - 不变式：每个 `ENDIF`/循环出口后，`M` 恢复到预期值；没有 lane 被永久丢失。
 
 **验收**：结构化控制流测试与黄金模型逐 lane 状态一致；所有非法程序被汇编器拒绝；
-mask 指令计数和理论值一致（汇编器的开销可见、可统计）。
+mask 指令计数和理论值一致（汇编器的开销可见、可统计）；warp 内归约（`SHFL.BFLY`
+求和、`SHFL.UP` 前缀和）和 `VOTE` 分叉与黄金模型一致。
 
 ## P5 — 内存层次
 
@@ -130,6 +141,7 @@ mask 指令计数和理论值一致（汇编器的开销可见、可统计）。
 - `rtl/mem/SK_coalescer.sv`：同一 cache line 的 active lane 合并成一次事务。
 - `rtl/mem/SK_smem.sv`：多 bank shared memory + 冲突检测与 replay。
 - `rtl/mem/SK_axi_master.sv`：AXI4 突发读写（先 64-bit，后 128/512-bit）。
+- `AXI_*` 性能计数器（事务 / beat / 字节 / 停顿，M5 的对比表用，见 §13）。
 - `rtl/mem/SK_l1_cache.sv`（可选）：直接映射或 2 路组相联。
 - 优化版 vecadd/sgemm，测量与理论带宽的差距。
 

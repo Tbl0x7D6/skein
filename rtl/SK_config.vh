@@ -4,7 +4,7 @@
 `define SK_CONFIG_VH
 
 `define SK_XLEN         32     // 数据宽度
-`define SK_NUM_LANES    4      // 每个 warp 的 lane 数（4/8 由综合实验定）
+`define SK_NUM_LANES    4      // warpSize：每个 warp 的 lane 数（4/8 由综合实验定）
 `define SK_NUM_WARPS    4      // 每核 warp 数
 `define SK_NUM_GPR      32     // 每 lane 通用寄存器数（r0 恒为 0）
 `define SK_NUM_PRED     8      // 每 lane 谓词数

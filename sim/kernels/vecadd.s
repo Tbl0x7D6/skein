@@ -1,6 +1,6 @@
 ; vecadd：c[i] = a[i] + b[i]
 ; 参数：PTR_A/PTR_B/PTR_C 是设备端地址，ARG0 = n
-; TID 是 block 内的全局线程号（= wid * NTID + laneid），stride = NWARP * NTID
+; TID 是 block 内的全局线程号（= wid * WARPSZ + laneid），stride = BLOCK_DIM
 ;
 ; 循环的 mask 序列手写，模板见 docs/design.md §6.3：
 ;   r24 = 进入循环时的 mask（退出后用 r24 重聚）
@@ -10,10 +10,9 @@
         SREAD   r2, S_PTR_B
         SREAD   r3, S_PTR_C
         SREAD   r4, S_ARG0          ; n
-        SREAD   r5, S_NWARP
-        SREAD   r6, S_NTID
-        SREAD   r11, S_TID          ; i = wid * NTID + laneid
-        MUL     r9, r5, r6          ; stride = NWARP * NTID
+        SREAD   r6, S_BLOCK_DIM     ; blockDim.x
+        SREAD   r11, S_TID          ; i = wid * WARPSZ + laneid
+        MOV     r9, r6              ; stride = blockDim.x
 
         MSAVE   r24                 ; 循环外的 mask
         MSAVE   r25                 ; 继续 mask

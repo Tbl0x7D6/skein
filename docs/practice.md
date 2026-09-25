@@ -60,7 +60,8 @@ end
 
 ### 1.6 存储与 DSP
 
-- **寄存器堆不用 BRAM**：每 lane 32×32b、2 读 1 写，用分布式 RAM（LUTRAM）或 FF 阵列。
+- **寄存器堆不用 BRAM**：每 lane 32×32b、3 读 1 写（`FMA` 的 `rd` 既读又写），
+  用分布式 RAM（LUTRAM）或 FF 阵列。
   综合时确认推断成 `RAM32M`/`RAM64X1D` 一类分布式 RAM；不要让它意外落成 BRAM，
   也不要落成纯 LUT 大 mux 导致面积膨胀。
 - **BRAM 的使用者**：IMEM、shared memory、以后的 cache。IMEM 和 shared 都是
@@ -180,7 +181,7 @@ auto uuid = device.load_xclbin("skein.xclbin");
 xrt::kernel krnl(device, uuid, "SK_afu");
 
 // 1) 通过 register map 装载 IMEM 镜像（每字一个 AXI-Lite 写）
-// 2) 写 GRID_DIM / BLOCK_DIM / PTR_A/B/C / ARG0..
+// 2) 写 GRID_DIM / BLOCK_DIM / PTR_A/B/C / ARG0..（BLOCK_DIM 必须是 SK_NUM_LANES 的整数倍）
 
 // 3) 数据缓冲
 xrt::bo bo_a(device, bytes, krnl.group_id(0));

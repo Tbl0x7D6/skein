@@ -24,6 +24,10 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     dump_state: Option<PathBuf>,
 
+    /// 打印各分类的指令条数（性能计数，见 docs/design.md §13）
+    #[arg(long)]
+    stats: bool,
+
     /// 设置特殊寄存器，可重复：--set PTR_A=0x1000
     #[arg(long = "set", value_name = "NAME=VALUE", value_parser = parse_sreg)]
     sregs: Vec<(Sreg, u32)>,
@@ -32,9 +36,17 @@ struct Args {
     #[arg(long, value_name = "N", default_value_t = NUM_WARPS, value_parser = parse_nwarp)]
     nwarp: usize,
 
-    /// 每个 warp 的 lane 数
-    #[arg(long, value_name = "N", default_value_t = NUM_LANES, value_parser = parse_ntid)]
-    ntid: usize,
+    /// warpSize：每个 warp 的 lane 数
+    #[arg(long, value_name = "N", default_value_t = NUM_LANES, value_parser = parse_warpsz)]
+    warpsz: usize,
+
+    /// blockDim.x：block 线程数（默认用满容量 NWARP × WARPSZ）
+    #[arg(long, value_name = "N", value_parser = parse_usize)]
+    bdim: Option<usize>,
+
+    /// block 数（按 block 顺序执行）
+    #[arg(long, value_name = "N", default_value_t = 1, value_parser = parse_grid)]
+    grid: u32,
 
     /// global memory 大小（字节）
     #[arg(long, value_name = "BYTES", default_value_t = 1 << 20, value_parser = parse_usize)]
@@ -79,7 +91,7 @@ fn parse_usize(text: &str) -> Result<usize, String> {
     usize::try_from(value).map_err(|_| format!("需要一个非负整数：{text}"))
 }
 
-fn parse_ntid(text: &str) -> Result<usize, String> {
+fn parse_warpsz(text: &str) -> Result<usize, String> {
     let value = parse_usize(text)?;
     if !(1..=32).contains(&value) {
         return Err(format!("lane 数要在 1..=32：{text}"));
@@ -95,6 +107,14 @@ fn parse_nwarp(text: &str) -> Result<usize, String> {
     Ok(value)
 }
 
+fn parse_grid(text: &str) -> Result<u32, String> {
+    let value = parse_usize(text)?;
+    if !(1..=65535).contains(&value) {
+        return Err(format!("block 数要在 1..=65535：{text}"));
+    }
+    Ok(value as u32)
+}
+
 /// `NAME=VALUE` -> (特殊寄存器, 值)。
 fn parse_sreg(text: &str) -> Result<(Sreg, u32), String> {
     let (name, value) = match text.split_once('=') {
@@ -107,6 +127,15 @@ fn parse_sreg(text: &str) -> Result<(Sreg, u32), String> {
         Some(sreg) => sreg,
         None => return Err(format!("不认识的特殊寄存器：{name}")),
     };
+    match sreg {
+        Sreg::PtrA | Sreg::PtrB | Sreg::PtrC | Sreg::Arg0 | Sreg::Arg1 | Sreg::Arg2 => {}
+        _ => {
+            return Err(format!(
+                "{} 是只读的；--set 只能设置 PTR_A/PTR_B/PTR_C/ARG0/ARG1/ARG2",
+                sreg.text()
+            ))
+        }
+    }
     let value = parse_number(value.trim())?;
     let value = u32::try_from(value).map_err(|_| format!("值超出 32 位：{text}"))?;
     Ok((sreg, value))
@@ -148,14 +177,15 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
     let config = Config {
-        ntid: args.ntid.max(1),
+        warpsz: args.warpsz.max(1),
         nwarp: args.nwarp.max(1),
+        block_dim: args.bdim,
+        grid: args.grid,
         smem_bytes: args.smem_bytes.max(4),
         gmem_bytes: args.gmem_bytes.max(4),
         sregs: args.sregs,
         trace: args.trace,
         max_steps: args.max_steps as u64,
-        ..Config::default()
     };
 
     let mut machine = Machine::new(image, config);
@@ -176,6 +206,13 @@ fn main() -> ExitCode {
         machine.steps,
         machine.barriers
     );
+    if args.stats {
+        let counts: Vec<String> = machine
+            .op_counts()
+            .map(|(class, value)| format!("{}={value}", class.text()))
+            .collect();
+        println!("ops: {}", counts.join(" "));
+    }
     if status == Status::Ok {
         ExitCode::SUCCESS
     } else {
