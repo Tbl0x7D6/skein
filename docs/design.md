@@ -33,7 +33,7 @@ RTL 宏集中在 [SK_config.vh](../rtl/SK_config.vh)：
 自己分配和复用（约定用 r24–r31，见 §6.5）；不够时得自己溢出到 shared memory，
 策略留到写软件阶段再说。
 
-`sim/src/isa.rs` 里的常量与这份参数保持一致。
+`tools/src/isa.rs` 里的常量与这份参数保持一致。
 
 ## 3. 结构
 
@@ -96,7 +96,7 @@ coalescer、AXI、上板壳）随 P2–P6 加，清单见 [plan.md](plan.md)。
   结束后硬件置 done。
 - **汇编器的职责**：只做翻译——一行一条指令，认标签，编码成 32 位字。掩码序列
   （`MSAVE`/`MREST`/`MAND.P`/`MCLR.P`）是普通指令，由 kernel 手写；写法模板见 §6，
-  完整例子见 [sim/kernels/vecadd.s](../sim/kernels/vecadd.s)。
+  完整例子见 [cases/kernels/vecadd/vecadd.s](../cases/kernels/vecadd/vecadd.s)。
 
 ## 5. 指令集
 
@@ -327,7 +327,7 @@ start → 轮询 done/error。入口固定 `0x0000`。
         MOV     r9, r6              ; 每条 lane 冗余计算
 ```
 
-循环在源码里就是这段手写的 mask 序列（`sim/kernels/vecadd.s` 的内容，`r24` 是循环外的
+循环在源码里就是这段手写的 mask 序列（`cases/kernels/vecadd/vecadd.s` 的内容，`r24` 是循环外的
 mask、`r25` 是继续 mask）：
 
 ```asm
@@ -567,9 +567,9 @@ GPU 顶层做成标准 Vitis RTL kernel：
 **代价**：mask 序列要手写——每个 `IF/ELSE` 大约几条 mask 指令、循环每轮几条，寄存器
 压力也落在写 kernel 的人身上（`r24–r31` 八个掩码寄存器，不够就溢出到 shared，留到
 软件阶段处理）；验证负担从硬件转移到"手写的 mask 序列"上，所以 §6 的模板和
-`sim/kernels/` 里的例子就是规范，测试也跟着测这些序列。
+`cases/kernels/` 里的例子就是规范，测试也跟着测这些序列。
 
-具体做法（P0）：汇编器只做编码（`sim/src/asm.rs`，一行一条指令）；掩码序列按 §6 的
+具体做法（P0）：汇编器只做编码（`tools/src/asm.rs`，一行一条指令）；掩码序列按 §6 的
 模板手写。`IF` 的 merge 用两条路径退出 mask 的 `MOR`，这样路径里的 break/continue
 收窄不会被 merge 撤销。`.P` 的 `M` 只作用在谓词上（`p & M`），所以从比 `M` 宽的外层
 mask 里删 lane 可以直接写（见 §6.4）；要交集就显式把当前 mask 当 `ra`。`M` 的写入者

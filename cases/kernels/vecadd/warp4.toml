@@ -1,0 +1,30 @@
+# vecadd：4 warp × 4 lane，n = 37（16 线程 + 非整除的 n，制造 lane 分歧）
+program = "vecadd.s"
+warpsz = 4
+nwarp = 4
+
+[sreg]
+PTR_A = 0x1000
+PTR_B = 0x2000
+PTR_C = 0x3000
+ARG0 = 37
+
+[[init]]
+space = "gmem"
+addr = 0x1000
+gen = "vecadd_a"
+args = { n = 37 }
+
+[[init]]
+space = "gmem"
+addr = 0x2000
+gen = "vecadd_b"
+args = { n = 37 }
+
+[[check]]
+space = "gmem"
+addr = 0x3000
+words = 37
+
+[expect]
+status = "OK"

@@ -1,0 +1,8 @@
+# P1：算术、立即数、谓词组合修饰和 @p/@!p 门控
+program = "alu.s"
+warpsz = 1
+nwarp = 1
+block_dim = 1
+
+[expect]
+status = "OK"

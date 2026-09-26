@@ -24,23 +24,23 @@
 
 - 冻结 [design.md](design.md) §5 的编码：类 + 子码的主操作码段分配、`pred`/`func`
   字段、立即数和分支偏移宽度、保留编码、寄存器/谓词/mask 编号、`STATUS` 错误码。
-  `sim/src/isa.rs` 是编码的唯一来源，汇编器和黄金模型都从它取定义。
-- `sim/src/asm.rs`：Rust 汇编器，编译成 `skein-asm`。
+  `tools/src/isa.rs` 是编码的唯一来源，汇编器和黄金模型都从它取定义。
+- `tools/src/asm.rs`：Rust 汇编器，编译成 `skein-asm`。
   - 只做翻译：一行一条指令（认标签、去注释、编码成 32 位字），唯一的伪指令是
     `LI rd, imm`（展开成 1–3 条 `ADDI`/`LUI`/`LUM`/`ORI`）。
   - 控制流和掩码序列由 kernel 手写，模板见 [design.md](design.md) §6。
   - 不做编译检查：跨区域跳转、`BAR` 的 mask、掩码寄存器压力都不管
     （`BAR` 由硬件在运行时兜底）。
   - 输出：IMEM 二进制镜像（每字 32 位小端）。
-- `sim/src/golden.rs`：黄金模型（`skein-run`）。per-lane 寄存器/谓词、执行 mask `M`、
+- `tools/src/golden.rs`：黄金模型（`skein-run`）。per-lane 寄存器/谓词、执行 mask `M`、
   保存 mask 的 GPR、统一分支、mask 指令、`SHFL`/`VOTE`、两个地址空间和错误码；支持
   launch 形状（`GRID_DIM`/`BLOCK_DIM`，非法 `BLOCK_DIM` 在 start 时报 `BAD_LAUNCH`）；
   支持 `--trace`、`--stats` 和 `--dump-state`（dump 里包含 `M`、全部 GPR 和 `op_counts`）。
-- `sim/tests/`：`cargo test` 跑的集成测试。
+- `tools/tests/`：`cargo test` 跑的集成测试。
   - 定向 ISA 测试：每条指令至少一条，含错误码。
   - kernel 测试：手写的 mask 序列（`IF/ELSE` merge、循环收窄、continue、按 lane 的
-    break）、`kernels/vecadd.s`，以及 4 warp x 4 lane 协作搬 shared + `BAR` 的
-    `kernels/matmul.s`，都在黄金模型里逐 lane 比对。
+    break）、`cases/kernels/vecadd/vecadd.s`，以及 4 warp x 4 lane 协作搬 shared + `BAR`
+    的 `cases/kernels/matmul/matmul.s`，都在黄金模型里逐 lane 比对。
 - 定稿 `SK_config.vh` 参数。
 
 **验收**：vecadd 在黄金模型里算出正确结果；kernel 测试全部通过；非法的指令和操作数
@@ -62,13 +62,14 @@
   外加一个仿真用扫描口）、`SK_alu.sv`（RALU + 立即数 ALU + 比较器）、`SK_mask.sv`
   （1 位 `M` 的 mask 单元，含 `.P`/`.PM`）、`SK_lsu.sv`（地址、对齐、访存通道），
   以及 2 级流水的 `SK_core.sv`（取指 / 译码+执行+写回，统一分支在执行级解析）。
-- `tb/tb_core.cpp`：Verilator testbench + IMEM/shared/global 内存模型 + 黄金模型 dump
-  比对；测试程序在 `tb/programs/`（5 个汇编程序）。汇编器编不出非法程序，所以
-  BAD_INSN（保留编码）和 PC_OOB（跳出 IMEM）两个用例的镜像由 Makefile 直接写字节。
+- `tb/tb_core.cpp`：Verilator testbench + IMEM/shared/global 内存模型：喂输入、跑、
+  dump 状态。定向用例在 `cases/directed/`（`sum.s` + `sum.toml` 这样成对放）。
+  汇编器编不出非法程序，所以
+  BAD_INSN（保留编码）和 PC_OOB（跳出 IMEM）两个用例直接在 `.toml` 里给指令字。
 - 跑通 `sum = 0; for (i = 0; i < 10; i++) sum += i;`，得到 45。
 
-**验收**：`make rtl-sim` 跑通 5 个单 lane 汇编程序（sum / alu / if-else / mem / sreg）
-和 BAD_INSN / PC_OOB 两个错误码用例，状态与黄金模型逐寄存器一致。
+**验收**：`make rtl-sim` 跑通 5 个单 lane 汇编程序（sum / alu / if-else / mem / sreg）、
+BAD_INSN / PC_OOB 两个错误码用例和单 lane 版 vecadd，状态与黄金模型逐寄存器一致。
 
 **状态**：已完成。核是 2 级而不是 5 级——BRAM 取指一拍、执行级同拍写回，够跑通单 lane
 的全部语义；N lane 和 5 级流水分别在 P2、P3（和调度器、scoreboard 一起）展开。
@@ -118,7 +119,7 @@
   （`MSAVE/MREST/MMOV/MAND/MANDN/MOR/MNOT/MAND.P/MANDN.P/MOR.P/MCLR.P/
   MAND.PM/MANDN.PM/MOR.PM`）；`.P`/`.PM` 只用 `M` 过滤谓词，`.PM` 同拍写 `M`。
 - 统一分支：`BRZ/BRNZ` 在译码级解析（GPR 里的 mask 值已知），`JMP` 无条件跳转。
-- kernel 集成：`kernels/` 里的手写 mask 程序直接生成可上板的 IMEM 镜像。
+- kernel 集成：`cases/kernels/` 里的手写 mask 程序直接生成可上板的 IMEM 镜像。
 - `SHFL.IDX/UP/DOWN/BFLY`：执行级的 N×N lane 交换网络（`src_lane` 由 `rb` 算，
   越界或源 lane 不在 `M` 里时返回自己的值）。
 - `VOTE.ANY/ALL`：`M & pred_word` 后面的 OR/AND 树，结果写所有 lane 的 GPR，
@@ -193,15 +194,66 @@ mask 指令计数和理论值一致（汇编器的开销可见、可统计）；
 
 | 层 | 工具 | 速度 | 用途 |
 |---|---|---|---|
-| 黄金模型 | `sim/src/golden.rs` | 毫秒 | 语义正确性的唯一裁判 |
+| 黄金模型 | `tools/src/golden.rs` | 毫秒 | 语义正确性的唯一裁判 |
 | RTL 仿真 | Verilator + `tb/`（`make rtl-sim`） | 秒～分钟 | 每次改动后的回归 |
 | 上板 | Vivado + XRT | 小时 | 真实硬件与真实频率 |
 
 任何 RTL 改动都必须在"RTL 仿真 vs 黄金模型"这一层验证过，才允许进入综合或上板。
 
+### case（双仿真器对拍）
+
+`cases/` 下的 `*.toml` 是唯一的用例输入描述：黄金模型和 RTL testbench 吃同一份，
+`make rtl-sim` 逐个跑，`skein-case` 负责比对并汇总。case 在报告里的名字是它相对
+`cases/` 的路径（`directed/sum`、`kernels/vecadd/warp4`），`program` 之类的路径相对
+case 文件本身解析。
+
+```
+cases/
+  directed/          单条指令或小序列的定向用例（单 lane，RTL 全跑）
+  errors/            错误码：保留编码、取指越界
+  kernels/<kernel>/  真 kernel 的用例，按 kernel 分目录（vecadd / matmul）
+```
+
+```toml
+program = "sum.s"           # 或 words = [0x3b, 0x3a]（汇编器编不出的编码）
+warpsz = 1                  # 默认 4（warpSize；RTL 现在只支持 1）
+nwarp = 1                   # 默认 4
+block_dim = 1               # 可选，默认用满容量
+grid = 1
+max_steps = 100000          # 可选，黄金模型的步数上限
+
+[sreg]                      # 主机写的特殊寄存器
+PTR_A = 0x1000
+ARG0 = 4
+
+[[init]]                    # 初态：words 或 gen + args 二选一
+space = "gmem"              # gmem / smem，addr 是字节地址
+addr = 0x1000
+gen = "vecadd_a"            # 生成器见 tools/src/case.rs
+args = { n = 4 }
+
+[[check]]                   # 跑完要比对的窗口（RTL vs 黄金模型逐字比）
+space = "gmem"
+addr = 0x3000
+words = 4
+
+[expect]                    # 可选；语义期望（c[i]=a[i]+b[i]）写在 Rust 测试里
+status = "OK"
+barriers = 1
+max_steps = 20480
+```
+
+- `make rtl-sim`：每个 case 先跑黄金模型、再跑 RTL，逐项比 status / pc / `M` / GPR /
+  谓词 / `[[check]]` 窗口；形状超过 1 warp × 1 lane（RTL 还没做到）的 case 报 SKIP
+  并注明原因，最后打印 PASS/SKIP/FAIL 计数。
+- `make test` 里的 `tests/cases.rs` 不依赖 Verilator：每个 case 都跑一遍黄金模型并检查
+  `[expect]`，保证 case 本身是有效的测试。
+- 调试单个 case：`cargo run --bin skein-run -- --case cases/directed/sum.toml --trace`，
+  RTL 侧 `build/obj_core/tb_core --image … --dump-state state.json` 看快照。
+
 ### 黄金模型
 
-- Rust，黄金模型本身只用标准库（命令行解析用 clap），可断点调试。
+- Rust，黄金模型本身只用标准库；命令行用 clap，case 文件用 toml/serde，可断点调试。
 - 状态包括：每 lane 的 GPR、谓词、PC、执行 mask `M`、保存 mask 的 GPR、
   shared/global 内存和错误码。
 - `--trace` 输出每条指令的执行轨迹；`--dump-state` 输出结束时的完整状态，
@@ -229,9 +281,9 @@ mask 指令计数和理论值一致（汇编器的开销可见、可统计）；
 
 ### 自动比对
 
-测试程序结束后，testbench 从 DUT 抽出状态快照（每个 lane 的 GPR、谓词、`M`、
-保存 mask 的 GPR + 关键内存区间），和黄金模型 `--dump-state` 的输出逐行 diff。
-不一致时打印第一条差异的位置（寄存器号、lane、期望值、实际值）。
+`skein-case`（`make rtl-sim`）逐个跑 `cases/`：黄金模型在进程里跑，RTL 由 testbench
+跑完 dump 出状态快照（每个 warp 的 pc、GPR、谓词、`M` + case 声明的内存窗口），
+和黄金模型逐项比。不一致时打印寄存器号/lane/地址、期望值和实际值。
 
 ### 上板验证
 

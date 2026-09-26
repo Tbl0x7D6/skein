@@ -1,0 +1,31 @@
+# vecadd 的单 lane 版本：RTL 今天就能端到端跑（含初态和输出窗口比对）
+program = "vecadd.s"
+warpsz = 1
+nwarp = 1
+block_dim = 1
+
+[sreg]
+PTR_A = 0x1000
+PTR_B = 0x2000
+PTR_C = 0x3000
+ARG0 = 4
+
+[[init]]
+space = "gmem"
+addr = 0x1000
+gen = "vecadd_a"
+args = { n = 4 }
+
+[[init]]
+space = "gmem"
+addr = 0x2000
+gen = "vecadd_b"
+args = { n = 4 }
+
+[[check]]
+space = "gmem"
+addr = 0x3000
+words = 4
+
+[expect]
+status = "OK"

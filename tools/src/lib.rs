@@ -5,5 +5,6 @@
 //! - [`golden`]：黄金模型，ISA 语义的唯一裁判。
 
 pub mod asm;
+pub mod case;
 pub mod golden;
 pub mod isa;

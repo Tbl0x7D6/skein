@@ -1,0 +1,8 @@
+# JMP +4096：跳出 IMEM（4K 条指令），取指越界
+words = [0x40032]
+warpsz = 1
+nwarp = 1
+block_dim = 1
+
+[expect]
+status = "PC_OOB"

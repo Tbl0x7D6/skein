@@ -12,4 +12,4 @@ __pycache__/
 *.py[cod]
 
 # Rust
-sim/target/
+tools/target/

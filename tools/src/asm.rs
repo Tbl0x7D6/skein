@@ -2,7 +2,7 @@
 //!
 //! 只做三件事：去掉注释、记下标签、把指令编码成 32 位字。控制流和掩码序列是
 //! kernel 自己写的——`MSAVE`/`MREST`/`MAND.P`/`MCLR.P`/`BRZ` 都是普通指令，
-//! 写法模板见 docs/design.md §6，完整例子见 sim/kernels/vecadd.s。
+//! 写法模板见 docs/design.md §6，完整例子见 cases/kernels/vecadd/vecadd.s。
 //!
 //! 唯一的伪指令是 `LI rd, imm`：展开成 1–3 条 `ADDI`/`LUI`/`LUM`/`ORI`。
 

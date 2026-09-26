@@ -1,6 +1,6 @@
 //! Skein 公共类型：译码结果、ALU 微操作、状态码。
 //!
-//! 指令编码的唯一来源是 sim/src/isa.rs（对应 docs/design.md §5.3），这里只放 RTL
+//! 指令编码的唯一来源是 tools/src/isa.rs（对应 docs/design.md §5.3），这里只放 RTL
 //! 译码需要的类型；改编码时两处一起改。全局参数见 SK_config.vh。
 
 package SK_pkg;

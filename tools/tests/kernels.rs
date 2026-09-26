@@ -1,11 +1,13 @@
-//! kernel 级测试：手写 mask 序列（IF/ELSE、循环、break/continue、vecadd）。
+//! kernel 级测试：手写 mask 序列（IF/ELSE、循环、break/continue），以及从 cases/
+//! 装载输入的 vecadd / matmul 语义对照。
 
 mod common;
 
-use common::{gprs, one_warp, run};
-use skein::asm;
-use skein::golden::{Config, Machine, Space};
-use skein::isa::{Sreg, Status};
+use common::{gprs, run};
+use skein::case::Case;
+use skein::golden::{Machine, Space};
+use skein::isa::Status;
+use std::path::Path;
 
 /// matmul kernel 的内层维度（kernel 里写死 16）。
 const MATMUL_N: usize = 16;
@@ -205,77 +207,75 @@ fn break_in_then_keeps_else_lanes() {
     assert_eq!(gprs(&m, 1, 0), [4, 4, 2, 2]); // then 的 lane 第 2 轮 break
 }
 
+/// 从 `cases/` 里读一个 case 并跑黄金模型：输入（初态、形状、参数）以 case 为准。
+fn run_case(name: &str) -> (Case, Machine) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../cases")
+        .join(format!("{name}.toml"));
+    let case = Case::load(&path).unwrap_or_else(|err| panic!("{err}"));
+    let mut machine = case.machine(false).unwrap_or_else(|err| panic!("{err}"));
+    machine.run();
+    (case, machine)
+}
+
+/// case 里声明的特殊寄存器（PTR_A / ARG0 …）。
+fn sreg_of(case: &Case, name: &str) -> u32 {
+    case.sreg(name)
+        .unwrap_or_else(|| panic!("{} 里没有 {name}", case.name))
+}
+
+fn gmem(machine: &Machine, addr: u32, words: usize) -> Vec<u32> {
+    (0..words)
+        .map(|index| machine.read_word(Space::Gmem, addr as usize + 4 * index))
+        .collect()
+}
+
 #[test]
 fn vecadd_matches_reference() {
-    let n: u32 = 37; // 16 线程 + 非整除的 n，制造 lane 分歧
-    let output = asm::assemble(include_str!("../kernels/vecadd.s")).unwrap();
-    let config = Config {
-        nwarp: 4,
-        ..one_warp()
-    }
-    .with(Sreg::PtrA, 0x1000)
-    .with(Sreg::PtrB, 0x2000)
-    .with(Sreg::PtrC, 0x3000)
-    .with(Sreg::Arg0, n);
-    let mut machine = Machine::new(output.words, config);
-    let a: Vec<u32> = (0..n).map(|i| i * 3 + 1).collect();
-    let b: Vec<u32> = (0..n).map(|i| i * 7 + 2).collect();
-    for i in 0..n as usize {
-        machine.write_word(Space::Gmem, 0x1000 + 4 * i, a[i]);
-        machine.write_word(Space::Gmem, 0x2000 + 4 * i, b[i]);
-    }
-    machine.run();
+    // 输入（a/b 的初态、指针、n）都来自 cases/vecadd.toml，这里只加语义断言
+    let (case, machine) = run_case("kernels/vecadd/warp4");
     assert_eq!(machine.status, Status::Ok);
-    for i in 0..n as usize {
+    let (a_ptr, b_ptr, c_ptr) = (
+        sreg_of(&case, "PTR_A"),
+        sreg_of(&case, "PTR_B"),
+        sreg_of(&case, "PTR_C"),
+    );
+    let n = sreg_of(&case, "ARG0") as usize;
+    let (a, b, c) = (
+        gmem(&machine, a_ptr, n),
+        gmem(&machine, b_ptr, n),
+        gmem(&machine, c_ptr, n),
+    );
+    for i in 0..n {
+        assert_eq!(c[i], a[i].wrapping_add(b[i]), "i = {i}");
+    }
+    // 没有越界写
+    assert_eq!(machine.read_word(Space::Gmem, c_ptr as usize + 4 * n), 0);
+}
+
+/// 从 case 读回 A、B，算参考结果，和 C 窗口逐元素比。
+fn check_matmul(case: &Case, machine: &Machine) {
+    let rows = sreg_of(case, "ARG0") as usize;
+    let a: Vec<i32> = gmem(machine, sreg_of(case, "PTR_A"), rows * MATMUL_N)
+        .iter()
+        .map(|value| *value as i32)
+        .collect();
+    let b: Vec<i32> = gmem(machine, sreg_of(case, "PTR_B"), MATMUL_N * MATMUL_N)
+        .iter()
+        .map(|value| *value as i32)
+        .collect();
+    let c = gmem(machine, sreg_of(case, "PTR_C"), rows * MATMUL_N);
+    let expect = matmul_reference(rows, &a, &b);
+    for index in 0..rows * MATMUL_N {
         assert_eq!(
-            machine.read_word(Space::Gmem, 0x3000 + 4 * i),
-            a[i].wrapping_add(b[i]),
-            "i = {i}"
+            c[index] as i32,
+            expect[index],
+            "{}：第 {} 行第 {} 列",
+            case.name,
+            index / MATMUL_N,
+            index % MATMUL_N
         );
     }
-    assert_eq!(machine.read_word(Space::Gmem, 0x3000 + 4 * n as usize), 0); // 没有越界写
-}
-
-/// 跑一次 matmul kernel，返回（结束状态, BAR 次数, 指令数, C 的内容）。
-fn run_matmul(rows: usize) -> (Status, u64, u64, Vec<u32>) {
-    run_matmul_with(rows, None)
-}
-
-/// 同上，但可以指定 `blockDim.x`（`None` = 用满容量）。
-fn run_matmul_with(rows: usize, block_dim: Option<usize>) -> (Status, u64, u64, Vec<u32>) {
-    let output = asm::assemble(include_str!("../kernels/matmul.s")).unwrap();
-    let config = Config {
-        nwarp: 4,
-        block_dim,
-        ..one_warp()
-    }
-    .with(Sreg::PtrA, 0x1000)
-    .with(Sreg::PtrB, 0x2000)
-    .with(Sreg::PtrC, 0x3000)
-    .with(Sreg::Arg0, rows as u32);
-    let mut machine = Machine::new(output.words, config);
-    for (index, value) in matmul_a(rows).iter().enumerate() {
-        machine.write_word(Space::Gmem, 0x1000 + 4 * index, *value as u32);
-    }
-    for (index, value) in matmul_b().iter().enumerate() {
-        machine.write_word(Space::Gmem, 0x2000 + 4 * index, *value as u32);
-    }
-    let status = machine.run();
-    let c = (0..rows * MATMUL_N)
-        .map(|index| machine.read_word(Space::Gmem, 0x3000 + 4 * index))
-        .collect();
-    (status, machine.barriers, machine.steps, c)
-}
-
-/// 小整数，乘法不会溢出，方便和参考结果比。
-fn matmul_a(rows: usize) -> Vec<i32> {
-    (0..rows * MATMUL_N).map(|i| (i as i32 % 7) - 3).collect()
-}
-
-fn matmul_b() -> Vec<i32> {
-    (0..MATMUL_N * MATMUL_N)
-        .map(|i| (i as i32 % 5) - 2)
-        .collect()
 }
 
 fn matmul_reference(rows: usize, a: &[i32], b: &[i32]) -> Vec<i32> {
@@ -295,44 +295,19 @@ fn matmul_reference(rows: usize, a: &[i32], b: &[i32]) -> Vec<i32> {
 #[test]
 fn matmul_multi_warp() {
     // 4 warp x 4 lane 协作把 A、B 搬进 shared，BAR 之后每个线程算自己认领的行。
-    // rows = 16 时每线程正好一行（无分歧）；20/23 时前几个线程要算两行（有分歧）。
-    for rows in [16usize, 20, 23] {
-        let (status, barriers, steps, c) = run_matmul(rows);
-        assert_eq!(status, Status::Ok, "rows = {rows}");
-        assert_eq!(barriers, 1, "rows = {rows}");
-        // 粗回归：每个 MAC 摊到的 warp 指令数应该在 3 左右；万一 stride 算错
-        // （比如拿 WARPSZ 当 stride）导致各 warp 重复劳动，这里会立刻炸。
-        let macs = rows * MATMUL_N * MATMUL_N;
-        assert!(
-            steps < 5 * macs as u64,
-            "rows = {rows}：{steps} 条指令 / {macs} 个 MAC，划分可能退化了"
-        );
-        let expect = matmul_reference(rows, &matmul_a(rows), &matmul_b());
-        for index in 0..rows * MATMUL_N {
-            assert_eq!(
-                c[index] as i32,
-                expect[index],
-                "rows = {rows}，第 {} 行第 {} 列",
-                index / MATMUL_N,
-                index % MATMUL_N
-            );
-        }
+    // rows = 16 时每线程正好一行（无分歧）；rows = 23 时前几个线程要算两行（有分歧）。
+    // BAR 次数和步数上界写在 case 的 [expect] 里，由 tests/cases.rs 统一检查。
+    for name in ["kernels/matmul/rows16", "kernels/matmul/rows23"] {
+        let (case, machine) = run_case(name);
+        assert_eq!(machine.status, Status::Ok, "{name}");
+        check_matmul(&case, &machine);
     }
 }
 
 #[test]
 fn matmul_runs_with_smaller_block() {
-    // BLOCK_DIM = 8（2 条 warp）：线程少了，认领行的 stride 要跟着变成 blockDim.x
-    for rows in [16usize, 20] {
-        let (status, barriers, _, c) = run_matmul_with(rows, Some(8));
-        assert_eq!(status, Status::Ok, "rows = {rows}");
-        assert_eq!(barriers, 1, "rows = {rows}");
-        let expect = matmul_reference(rows, &matmul_a(rows), &matmul_b());
-        for index in 0..rows * MATMUL_N {
-            assert_eq!(
-                c[index] as i32, expect[index],
-                "rows = {rows}，第 {index} 个元素"
-            );
-        }
-    }
+    // blockDim.x = 8（2 条 warp）：线程少了，认领行的 stride 要跟着变成 blockDim.x
+    let (case, machine) = run_case("kernels/matmul/bdim8");
+    assert_eq!(machine.status, Status::Ok);
+    check_matmul(&case, &machine);
 }

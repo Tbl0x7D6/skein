@@ -247,6 +247,23 @@ coded_enum!(
     }
 );
 
+impl Sreg {
+    /// 名字 -> 特殊寄存器：接受 `PTR_A` / `S_PTR_A`，大小写不敏感。
+    pub fn from_name(name: &str) -> Option<Sreg> {
+        let upper = name.trim().to_uppercase();
+        let bare = upper.strip_prefix("S_").unwrap_or(&upper);
+        Sreg::from_text(bare)
+    }
+
+    /// 主机能写的特殊寄存器：命令行 `--set` 和 case 的 `[sreg]` 都只允许这些。
+    pub const fn writable(self) -> bool {
+        matches!(
+            self,
+            Sreg::PtrA | Sreg::PtrB | Sreg::PtrC | Sreg::Arg0 | Sreg::Arg1 | Sreg::Arg2
+        )
+    }
+}
+
 coded_enum!(
     /// STATUS 错误码，非 0 表示 kernel 已经报错结束。
     Status {

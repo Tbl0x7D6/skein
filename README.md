@@ -5,18 +5,18 @@ Skein 是一个从零手写的小型 SIMT 处理器（GPGPU），目标是把 FP
 
 指令集是自己设计的 32 位定长 ISA，不依赖现成编译器；kernel 用手写汇编，配一个
 汇编器和一个黄金模型。ISA 编码已经冻结（[design.md](docs/design.md) §5）；汇编器、
-黄金模型和测试在 `sim/`（Rust），单 lane 的核在 `rtl/`（P1 已完成），两者用同一份
+黄金模型和测试在 `tools/`（Rust），单 lane 的核在 `rtl/`（P1 已完成），两者用同一份
 程序逐寄存器对拍。
 
 ## 快速上手
 
 ```bash
-make test                                        # Rust 测试：ISA + kernel（手写 mask）
-make asm SRC=sim/kernels/vecadd.s                # 汇编成 build/vecadd.bin
-make sim SRC=sim/kernels/vecadd.s ARGS="--trace" # 在黄金模型里跑
-make sim SRC=sim/kernels/vecadd.s ARGS="--help"  # 两个工具的完整选项（clap 生成）
-make rtl-sim                                     # Verilator 跑单 lane 核，与黄金模型对拍
-make regress                                     # 上面全跑一遍：fmt + clippy + test + lint + 仿真
+make test                                                        # Rust 测试：ISA + kernel
+make asm SRC=cases/kernels/vecadd/vecadd.s                       # 汇编成 build/vecadd.bin
+make sim SRC=cases/kernels/vecadd/vecadd.s ARGS="--trace"        # 在黄金模型里跑
+make sim SRC=cases/kernels/vecadd/vecadd.s ARGS="--help"         # 两个工具的完整选项（clap 生成）
+make rtl-sim                                                    # 把 cases/ 逐个送进 RTL 和黄金模型对拍
+make regress                                                    # 上面全跑一遍：fmt + clippy + test + lint + 仿真
 ```
 
 ## 目标
@@ -45,10 +45,14 @@ make regress                                     # 上面全跑一遍：fmt + cl
 rtl/       可综合 RTL。lib/ 通用原语，core/ 译码执行提交与 SK_core，sched/ warp
            调度与 scoreboard，mem/ IMEM、shared、AXI 与 coalescer，top/ 上板壳；
            SK_config.vh 是全局参数，SK_pkg.sv 是公共类型
-sim/       Rust 工具链（一个 cargo crate）：src/isa.rs 编码定义、src/asm.rs 汇编器
-           （一行一条指令）、src/golden.rs 黄金模型、src/bin/ 里的 skein-asm
-           和 skein-run（命令行用 clap）、tests/ 测试、kernels/ 汇编源码
-tb/        Verilator testbench 与 P1 的单 lane 测试程序（programs/）
+tools/     Rust 工具链（一个 cargo crate）：src/isa.rs 编码定义、src/asm.rs 汇编器
+           （一行一条指令）、src/golden.rs 黄金模型、src/case.rs 用例加载、
+           src/bin/ 里的 skein-asm / skein-run / skein-case（命令行用 clap）、
+           tests/ 测试
+cases/     用例：程序 + launch 形状 + 初态 + 比对窗口，golden 和 RTL 共用（*.toml）；
+           directed/ 定向、errors/ 错误码、kernels/<kernel>/ 按 kernel 分目录
+           （kernel 汇编源码和它的用例放一起）
+tb/        Verilator testbench（tb_core.cpp）：喂输入、跑、dump 状态
 syn/u250/  v++ 打包脚本与链接配置
 sw/        主机程序：runtime/ XRT 驱动、tests/ 上板用例
 ```

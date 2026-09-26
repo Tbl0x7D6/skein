@@ -1,0 +1,32 @@
+# matmul：blockDim.x = 8（2 条 warp），认领行的 stride 要跟着变成 blockDim.x
+program = "matmul.s"
+warpsz = 4
+nwarp = 4
+block_dim = 8
+
+[sreg]
+PTR_A = 0x1000
+PTR_B = 0x2000
+PTR_C = 0x3000
+ARG0 = 20
+
+[[init]]
+space = "gmem"
+addr = 0x1000
+gen = "matmul_a"
+args = { rows = 20 }
+
+[[init]]
+space = "gmem"
+addr = 0x2000
+gen = "matmul_b"
+
+[[check]]
+space = "gmem"
+addr = 0x3000
+words = 320
+
+[expect]
+status = "OK"
+barriers = 1
+max_steps = 25600

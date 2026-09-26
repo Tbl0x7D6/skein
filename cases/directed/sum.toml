@@ -1,0 +1,8 @@
+# P1：sum = 0 + 1 + … + 9 = 45，循环用 design.md §6.3 的 mask 模板
+program = "sum.s"
+warpsz = 1
+nwarp = 1
+block_dim = 1
+
+[expect]
+status = "OK"

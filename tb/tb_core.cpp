@@ -1,12 +1,18 @@
-//! P1 单 lane 核的 Verilator testbench。
+//! P1 单 lane 核的 Verilator testbench：喂输入、跑到底、dump 状态。
 //!
-//! 装载 IMEM 镜像、驱动特殊寄存器和 shared/global 内存模型，跑到 done 或者出错，
-//! 然后和 `skein-run --dump-state` 出来的黄金模型状态逐寄存器比对。内存模型和黄金
-//! 模型的默认容量一致（shared 32 KB、global 1 MB），越界由这里报给核。
+//! 这里不做比对——`skein-case`（tools/src/bin/skein-case.rs）把这份 dump 和黄金模型逐项
+//! 比对。testbench 只负责：装载 IMEM 镜像和 shared/global 初态、驱动特殊寄存器、
+//! 跑到 done 或者报错，然后按 --mem-window 把架构状态和内存窗口写成 JSON，
+//! 字段和 `skein-run --dump-state` 对齐（多一个 "mem"）。
 //!
 //! 用法：
-//!   tb_core <image.bin> [--expect <state.json>] [--set NAME=VALUE]...
-//!           [--max-cycles N] [--trace] [--dump-state <file>]
+//!   tb_core --image <image.bin> [--set NAME=VALUE]...
+//!           [--gmem-init ADDR FILE]... [--smem-init ADDR FILE]...
+//!           [--mem-window SPACE ADDR WORDS]... [--max-cycles N] [--trace]
+//!           [--dump-state <file>]
+//!
+//! 形状固定 1 warp × 1 lane（WARPSZ/NWARP/BLOCK_DIM/GRID 都是 1，TID/LANEID/WID/BID
+//! 都是 0）；多 warp / 多 lane 的 case 由 runner 跳过。
 
 #include <cctype>
 #include <cstdint>
@@ -22,61 +28,178 @@
 
 namespace {
 
-// 和黄金模型的默认值保持一致（skein-run --smem-bytes/--gmem-bytes）
+// 和黄金模型的默认值保持一致（tools/src/case.rs 的 SMEM_BYTES / GMEM_BYTES）
 constexpr uint32_t SMEM_BYTES = 32 * 1024;
 constexpr uint32_t GMEM_BYTES = 1 << 20;
 
-constexpr uint8_t DBG_M      = 0x20;
-constexpr uint8_t DBG_PRED   = 0x21;
-constexpr uint8_t DBG_PC_E   = 0x22;
+// 调试扫描口（见 rtl/core/SK_core.sv）
+constexpr uint8_t DBG_M = 0x20;
+constexpr uint8_t DBG_PRED = 0x21;
+constexpr uint8_t DBG_PC_E = 0x22;
 constexpr uint8_t DBG_STATUS = 0x23;
-constexpr uint8_t DBG_INSN   = 0x24;
-constexpr uint8_t DBG_RUN    = 0x25;
+constexpr uint8_t DBG_INSN = 0x24;
+constexpr uint8_t DBG_RUN = 0x25;
 constexpr uint8_t DBG_PC_ARCH = 0x26;
 
-// 特殊寄存器编号，和 sim/src/isa.rs 的 Sreg 一致
-constexpr int SREG_TID = 0x00, SREG_LANEID = 0x01, SREG_WID = 0x02, SREG_WARPSZ = 0x03;
-constexpr int SREG_NWARP = 0x04, SREG_GRID = 0x05, SREG_PTR_A = 0x06, SREG_PTR_B = 0x07;
-constexpr int SREG_PTR_C = 0x08, SREG_ARG0 = 0x09, SREG_ARG1 = 0x0A, SREG_ARG2 = 0x0B;
-constexpr int SREG_STATUS = 0x0C, SREG_BID = 0x0D, SREG_BLOCK_DIM = 0x0E;
+// 特殊寄存器编号，和 tools/src/isa.rs 的 Sreg 一致
+constexpr int SREG_TID = 0x00;
+constexpr int SREG_LANEID = 0x01;
+constexpr int SREG_WID = 0x02;
+constexpr int SREG_WARPSZ = 0x03;
+constexpr int SREG_NWARP = 0x04;
+constexpr int SREG_GRID = 0x05;
+constexpr int SREG_PTR_A = 0x06;
+constexpr int SREG_PTR_B = 0x07;
+constexpr int SREG_PTR_C = 0x08;
+constexpr int SREG_ARG0 = 0x09;
+constexpr int SREG_ARG1 = 0x0A;
+constexpr int SREG_ARG2 = 0x0B;
+constexpr int SREG_STATUS = 0x0C;
+constexpr int SREG_BID = 0x0D;
+constexpr int SREG_BLOCK_DIM = 0x0E;
 
-const char* status_name(int code) {
-    switch (code) {
-        case 0: return "OK";
-        case 1: return "BAD_INSN";
-        case 2: return "UNALIGNED";
-        case 3: return "SMEM_OOB";
-        case 4: return "GMEM_OOB";
-        case 5: return "BAR_INCOMPLETE";
-        case 6: return "PC_OOB";
-        case 7: return "BAD_LAUNCH";
-        default: return "?";
-    }
-}
+constexpr int NUM_GPR = 32;
+constexpr int NUM_PRED = 8;
 
-std::string base_name(const std::string& path) {
-    size_t slash = path.find_last_of('/');
-    std::string name = (slash == std::string::npos) ? path : path.substr(slash + 1);
-    size_t dot = name.find_last_of('.');
-    return (dot == std::string::npos) ? name : name.substr(0, dot);
-}
+struct SregValue {
+    int index = 0;
+    uint32_t value = 0;
+};
 
-bool read_file(const std::string& path, std::string& text) {
-    std::ifstream file(path);
-    if (!file) {
-        std::cerr << "打不开 " << path << "\n";
-        return false;
-    }
-    text.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
-    return true;
+/// 一段初态：把 FILE 里的 32 位小端字写到 ADDR（字节地址）。
+struct MemInit {
+    bool smem = false;
+    uint32_t addr = 0;
+    std::string file;
+};
+
+/// 跑完要比对的内存窗口。
+struct MemWindow {
+    bool smem = false;
+    uint32_t addr = 0;
+    uint32_t words = 0;
+};
+
+struct Options {
+    std::string image;
+    std::vector<SregValue> sregs;
+    std::vector<MemInit> inits;
+    std::vector<MemWindow> windows;
+    std::string state;
+    long max_cycles = 200000;
+    bool trace = false;
+};
+
+void usage() {
+    std::cerr << "用法：tb_core --image <image.bin> [--set NAME=VALUE]... "
+                 "[--gmem-init ADDR FILE]... [--smem-init ADDR FILE]... "
+                 "[--mem-window SPACE ADDR WORDS]... [--max-cycles N] [--trace] "
+                 "[--dump-state <file>]\n";
 }
 
 uint32_t parse_number(const std::string& text) {
     return (uint32_t)strtoul(text.c_str(), nullptr, 0);
 }
 
+/// 空间名 -> 是否 shared。
+bool parse_space(const std::string& text, bool& smem) {
+    if (text == "smem" || text == "shared") {
+        smem = true;
+        return true;
+    }
+    if (text == "gmem" || text == "global") {
+        smem = false;
+        return true;
+    }
+    std::cerr << "空间只能是 smem / gmem：" << text << "\n";
+    return false;
+}
+
+/// 特殊寄存器名 -> 编号（只认主机能写的那些）。
+int parse_sreg(const std::string& name, uint32_t value, SregValue& out) {
+    std::string upper = name;
+    for (char& ch : upper) {
+        ch = (char)std::toupper((unsigned char)ch);
+    }
+    if (upper.rfind("S_", 0) == 0) {
+        upper = upper.substr(2);
+    }
+    if (upper == "PTR_A") out.index = SREG_PTR_A;
+    else if (upper == "PTR_B") out.index = SREG_PTR_B;
+    else if (upper == "PTR_C") out.index = SREG_PTR_C;
+    else if (upper == "ARG0") out.index = SREG_ARG0;
+    else if (upper == "ARG1") out.index = SREG_ARG1;
+    else if (upper == "ARG2") out.index = SREG_ARG2;
+    else {
+        std::cerr << "--set 只支持 PTR_A/PTR_B/PTR_C/ARG0/ARG1/ARG2：" << name << "\n";
+        return 1;
+    }
+    out.value = value;
+    return 0;
+}
+
+bool parse_args(int argc, char** argv, Options& opt) {
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        auto need = [&](int count) {
+            if (i + count >= argc) {
+                std::cerr << arg << " 后面还差参数\n";
+                return false;
+            }
+            return true;
+        };
+        if (arg == "--image") {
+            if (!need(1)) return false;
+            opt.image = argv[++i];
+        } else if (arg == "--set") {
+            if (!need(1)) return false;
+            std::string pair = argv[++i];
+            size_t equal = pair.find('=');
+            if (equal == std::string::npos) {
+                std::cerr << "--set 的写法应为 NAME=VALUE：" << pair << "\n";
+                return false;
+            }
+            SregValue sreg;
+            if (parse_sreg(pair.substr(0, equal), parse_number(pair.substr(equal + 1)), sreg)) {
+                return false;
+            }
+            opt.sregs.push_back(sreg);
+        } else if (arg == "--gmem-init" || arg == "--smem-init") {
+            if (!need(2)) return false;
+            MemInit init;
+            init.smem = (arg == "--smem-init");
+            init.addr = parse_number(argv[++i]);
+            init.file = argv[++i];
+            opt.inits.push_back(init);
+        } else if (arg == "--mem-window") {
+            if (!need(3)) return false;
+            MemWindow window;
+            if (!parse_space(argv[++i], window.smem)) return false;
+            window.addr = parse_number(argv[++i]);
+            window.words = parse_number(argv[++i]);
+            opt.windows.push_back(window);
+        } else if (arg == "--max-cycles") {
+            if (!need(1)) return false;
+            opt.max_cycles = strtol(argv[++i], nullptr, 0);
+        } else if (arg == "--trace") {
+            opt.trace = true;
+        } else if (arg == "--dump-state") {
+            if (!need(1)) return false;
+            opt.state = argv[++i];
+        } else {
+            std::cerr << "不认识的参数：" << arg << "\n";
+            return false;
+        }
+    }
+    if (opt.image.empty()) {
+        usage();
+        return false;
+    }
+    return true;
+}
+
 /// IMEM 镜像：每字 32 位小端。
-bool load_image(const std::string& path, std::vector<uint32_t>& words) {
+bool load_words(const std::string& path, std::vector<uint32_t>& words) {
     std::ifstream file(path, std::ios::binary);
     if (!file) {
         std::cerr << "打不开 " << path << "\n";
@@ -95,143 +218,60 @@ bool load_image(const std::string& path, std::vector<uint32_t>& words) {
     return true;
 }
 
-/// 黄金模型 dump 里的一个标量字段。
-bool json_int(const std::string& text, const std::string& key, long& value) {
-    size_t pos = text.find(key);
-    if (pos == std::string::npos) {
+/// 把初态文件写进内存模型；越界或者没对齐直接报错。
+bool apply_init(const MemInit& init, std::vector<uint32_t>& smem, std::vector<uint32_t>& gmem) {
+    std::vector<uint32_t> words;
+    if (!load_words(init.file, words)) {
         return false;
     }
-    pos += key.size();
-    while (pos < text.size() && !std::isdigit((unsigned char)text[pos]) && text[pos] != '-') {
-        pos++;
-    }
-    if (pos >= text.size()) {
+    std::vector<uint32_t>& memory = init.smem ? smem : gmem;
+    uint32_t bytes = (uint32_t)(memory.size() * 4);
+    if (init.addr % 4 != 0 || init.addr + words.size() * 4 > bytes) {
+        std::cerr << init.file << ": 初态写到 0x" << std::hex << init.addr << std::dec
+                  << " 越界或者没对齐\n";
         return false;
     }
-    value = strtol(text.c_str() + pos, nullptr, 10);
-    return true;
-}
-
-/// 黄金模型 dump 里的数组字段（如 gpr / pred），按出现顺序取所有整数。
-bool json_ints(const std::string& text, const std::string& key, std::vector<long>& values) {
-    size_t pos = text.find(key);
-    if (pos == std::string::npos) {
-        return false;
-    }
-    while (pos < text.size() && text[pos] != '[') {
-        pos++;
-    }
-    if (pos >= text.size()) {
-        return false;
-    }
-    int depth = 0;
-    for (; pos < text.size(); pos++) {
-        char ch = text[pos];
-        if (ch == '[') {
-            depth++;
-        } else if (ch == ']') {
-            depth--;
-            if (depth == 0) {
-                return true;
-            }
-        } else if (std::isdigit((unsigned char)ch) || ch == '-') {
-            size_t end = pos;
-            if (text[end] == '-') {
-                end++;
-            }
-            while (end < text.size() && std::isdigit((unsigned char)text[end])) {
-                end++;
-            }
-            values.push_back(strtol(text.substr(pos, end - pos).c_str(), nullptr, 10));
-            pos = end - 1;
-        }
-    }
-    return false;
-}
-
-struct Golden {
-    long status = 0;
-    long pc = 0;
-    uint32_t m = 0;
-    std::vector<uint32_t> gpr;
-    std::vector<int> pred;
-};
-
-bool load_golden(const std::string& path, Golden& golden) {
-    std::string text;
-    if (!read_file(path, text)) {
-        return false;
-    }
-    std::vector<long> gpr, pred;
-    long mask = 0;
-    if (!json_int(text, "\"status\":", golden.status) || !json_int(text, "\"pc\":", golden.pc)
-        || !json_int(text, "\"m\":", mask) || !json_ints(text, "\"gpr\":", gpr)
-        || !json_ints(text, "\"pred\":", pred)) {
-        std::cerr << path << ": 解析失败（不是 skein-run --dump-state 的输出？）\n";
-        return false;
-    }
-    golden.m = (uint32_t)mask;
-    for (long value : gpr) {
-        golden.gpr.push_back((uint32_t)value);
-    }
-    for (long value : pred) {
-        golden.pred.push_back((int)value);
+    for (size_t i = 0; i < words.size(); i++) {
+        memory[init.addr / 4 + i] = words[i];
     }
     return true;
 }
 
-struct Options {
-    std::string image;
-    std::string expect;
-    std::string dump;
-    std::vector<std::pair<int, uint32_t>> sregs;
-    long max_cycles = 200000;
-    bool trace = false;
-};
-
-bool parse_args(int argc, char** argv, Options& opt) {
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        if (arg == "--expect" && i + 1 < argc) {
-            opt.expect = argv[++i];
-        } else if (arg == "--dump-state" && i + 1 < argc) {
-            opt.dump = argv[++i];
-        } else if (arg == "--max-cycles" && i + 1 < argc) {
-            opt.max_cycles = strtol(argv[++i], nullptr, 0);
-        } else if (arg == "--trace") {
-            opt.trace = true;
-        } else if (arg == "--set" && i + 1 < argc) {
-            std::string pair = argv[++i];
-            size_t equal = pair.find('=');
-            if (equal == std::string::npos) {
-                std::cerr << "--set 的写法应为 NAME=VALUE：" << pair << "\n";
-                return false;
-            }
-            std::string name = pair.substr(0, equal);
-            uint32_t value = parse_number(pair.substr(equal + 1));
-            int index = -1;
-            if (name == "PTR_A") index = SREG_PTR_A;
-            else if (name == "PTR_B") index = SREG_PTR_B;
-            else if (name == "PTR_C") index = SREG_PTR_C;
-            else if (name == "ARG0") index = SREG_ARG0;
-            else if (name == "ARG1") index = SREG_ARG1;
-            else if (name == "ARG2") index = SREG_ARG2;
-            else {
-                std::cerr << "--set 只支持 PTR_A/PTR_B/PTR_C/ARG0/ARG1/ARG2：" << name << "\n";
-                return false;
-            }
-            opt.sregs.emplace_back(index, value);
-        } else if (!arg.empty() && arg[0] == '-') {
-            std::cerr << "不认识的参数：" << arg << "\n";
-            return false;
-        } else {
-            opt.image = arg;
-        }
-    }
-    if (opt.image.empty()) {
-        std::cerr << "用法：tb_core <image.bin> [--expect <state.json>] [--set NAME=VALUE]...\n";
+/// 状态 + 内存窗口写成 JSON（形状对齐 skein-run --dump-state）。
+bool write_state(const Options& opt, uint32_t status, long cycles, const std::vector<uint32_t>& gpr,
+                 uint32_t pred, uint32_t m, uint32_t pc, const std::vector<uint32_t>& smem,
+                 const std::vector<uint32_t>& gmem) {
+    std::ofstream out(opt.state);
+    if (!out) {
+        std::cerr << "写不了 " << opt.state << "\n";
         return false;
     }
+    out << "{\n";
+    out << "  \"status\": " << status << ",\n";
+    out << "  \"cycles\": " << cycles << ",\n";
+    out << "  \"warps\": [\n";
+    out << "    {\n      \"wid\": 0,\n      \"pc\": " << pc << ",\n      \"m\": " << m << ",\n";
+    out << "      \"gpr\": [[";
+    for (size_t i = 0; i < gpr.size(); i++) {
+        out << (i ? ", " : "") << gpr[i];
+    }
+    out << "]],\n      \"pred\": [[";
+    for (int i = 0; i < NUM_PRED; i++) {
+        out << (i ? ", " : "") << ((pred >> i) & 1u);
+    }
+    out << "]]\n    }\n  ],\n";
+    out << "  \"mem\": [\n";
+    for (size_t index = 0; index < opt.windows.size(); index++) {
+        const MemWindow& window = opt.windows[index];
+        const std::vector<uint32_t>& memory = window.smem ? smem : gmem;
+        out << "    {\"space\": \"" << (window.smem ? "smem" : "gmem") << "\", \"addr\": "
+            << window.addr << ", \"words\": [";
+        for (uint32_t offset = 0; offset < window.words; offset++) {
+            out << (offset ? ", " : "") << memory[window.addr / 4 + offset];
+        }
+        out << "]}" << (index + 1 == opt.windows.size() ? "" : ",") << "\n";
+    }
+    out << "  ]\n}\n";
     return true;
 }
 
@@ -243,11 +283,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     std::vector<uint32_t> image;
-    if (!load_image(opt.image, image)) {
-        return 2;
-    }
-    Golden golden;
-    if (!opt.expect.empty() && !load_golden(opt.expect, golden)) {
+    if (!load_words(opt.image, image)) {
         return 2;
     }
 
@@ -257,6 +293,20 @@ int main(int argc, char** argv) {
 
     std::vector<uint32_t> smem(SMEM_BYTES / 4, 0);
     std::vector<uint32_t> gmem(GMEM_BYTES / 4, 0);
+    for (const MemInit& init : opt.inits) {
+        if (!apply_init(init, smem, gmem)) {
+            return 2;
+        }
+    }
+    for (const MemWindow& window : opt.windows) {
+        const std::vector<uint32_t>& memory = window.smem ? smem : gmem;
+        if (window.addr % 4 != 0
+            || window.addr / 4 + window.words > (uint32_t)(memory.size())) {
+            std::cerr << "比对窗口 0x" << std::hex << window.addr << std::dec
+                      << " 越界或者没对齐\n";
+            return 2;
+        }
+    }
 
     // 单 lane：WARPSZ/NWARP/BLOCK_DIM/GRID 都是 1，TID/LANEID/WID/BID 都是 0
     for (int i = 0; i < 16; i++) {
@@ -266,8 +316,8 @@ int main(int argc, char** argv) {
     dut->sreg_i[SREG_NWARP] = 1;
     dut->sreg_i[SREG_BLOCK_DIM] = 1;
     dut->sreg_i[SREG_GRID] = 1;
-    for (auto& [index, value] : opt.sregs) {
-        dut->sreg_i[index] = value;
+    for (const SregValue& sreg : opt.sregs) {
+        dut->sreg_i[sreg.index] = sreg.value;
     }
 
     auto drive_memory = [&]() {
@@ -347,7 +397,7 @@ int main(int argc, char** argv) {
     }
 
     std::vector<uint32_t> gpr;
-    for (int i = 0; i < 32; i++) {
+    for (int i = 0; i < NUM_GPR; i++) {
         gpr.push_back(dbg((uint8_t)i));
     }
     uint32_t status = dbg(DBG_STATUS);
@@ -355,69 +405,14 @@ int main(int argc, char** argv) {
     uint32_t pred = dbg(DBG_PRED);
     uint32_t pc = dbg(DBG_PC_ARCH);
 
-    if (!opt.dump.empty()) {
-        std::ofstream out(opt.dump);
-        out << "{\n";
-        out << "  \"status\": " << status << ",\n";
-        out << "  \"cycles\": " << cycles << ",\n";
-        out << "  \"pc\": " << pc << ",\n";
-        out << "  \"m\": " << m << ",\n";
-        out << "  \"gpr\": [[";
-        for (size_t i = 0; i < gpr.size(); i++) {
-            out << (i ? ", " : "") << gpr[i];
+    if (!opt.state.empty()) {
+        if (!write_state(opt, status, cycles, gpr, pred, m, pc, smem, gmem)) {
+            return 2;
         }
-        out << "]],\n  \"pred\": [[";
-        for (int i = 0; i < 8; i++) {
-            out << (i ? ", " : "") << ((pred >> i) & 1u);
-        }
-        out << "]]\n}\n";
     }
-
-    std::string name = base_name(opt.image);
     if (!dut->done_o) {
-        printf("%s: FAIL（%ld 拍还没结束，status=%s）\n", name.c_str(), cycles,
-               status_name((int)status));
+        std::cerr << opt.image << ": " << cycles << " 拍还没结束（status=" << status << "）\n";
         return 1;
     }
-    if (opt.expect.empty()) {
-        printf("%s: status=%s cycles=%ld pc=%u\n", name.c_str(), status_name((int)status), cycles,
-               pc);
-        return 0;
-    }
-
-    std::vector<std::string> errors;
-    if ((long)status != golden.status) {
-        errors.push_back("status 期望 " + std::string(status_name((int)golden.status)) + "("
-                         + std::to_string(golden.status) + ")，实际 "
-                         + status_name((int)status) + "(" + std::to_string(status) + ")");
-    }
-    if ((long)pc != golden.pc) {
-        errors.push_back("pc 期望 " + std::to_string(golden.pc) + "，实际 " + std::to_string(pc));
-    }
-    if (m != golden.m) {
-        errors.push_back("M 期望 " + std::to_string(golden.m) + "，实际 " + std::to_string(m));
-    }
-    for (size_t i = 0; i < golden.gpr.size() && i < gpr.size(); i++) {
-        if (gpr[i] != golden.gpr[i]) {
-            errors.push_back("r" + std::to_string(i) + " 期望 " + std::to_string(golden.gpr[i])
-                             + "，实际 " + std::to_string(gpr[i]));
-        }
-    }
-    for (size_t i = 0; i < golden.pred.size() && i < 8; i++) {
-        int actual = (pred >> i) & 1u;
-        if (actual != golden.pred[i]) {
-            errors.push_back("p" + std::to_string(i) + " 期望 " + std::to_string(golden.pred[i])
-                             + "，实际 " + std::to_string(actual));
-        }
-    }
-    if (!errors.empty()) {
-        printf("%s: FAIL（cycles=%ld）\n", name.c_str(), cycles);
-        for (const std::string& error : errors) {
-            printf("  %s\n", error.c_str());
-        }
-        return 1;
-    }
-    printf("%s: PASS（cycles=%ld, status=%s）\n", name.c_str(), cycles, status_name((int)status));
-    delete dut;
     return 0;
 }

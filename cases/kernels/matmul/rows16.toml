@@ -1,0 +1,32 @@
+# matmul：4 warp × 4 lane，rows = 16（每线程正好一行，无分歧）
+program = "matmul.s"
+warpsz = 4
+nwarp = 4
+
+[sreg]
+PTR_A = 0x1000
+PTR_B = 0x2000
+PTR_C = 0x3000
+ARG0 = 16
+
+[[init]]
+space = "gmem"
+addr = 0x1000
+gen = "matmul_a"
+args = { rows = 16 }
+
+[[init]]
+space = "gmem"
+addr = 0x2000
+gen = "matmul_b"
+
+[[check]]
+space = "gmem"
+addr = 0x3000
+words = 256
+
+[expect]
+status = "OK"
+barriers = 1
+# 每个 MAC 摊到的指令数应该在 3 左右；万一 stride 算错会多跑一倍以上
+max_steps = 20480

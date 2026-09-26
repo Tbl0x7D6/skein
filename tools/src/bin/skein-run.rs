@@ -6,15 +6,25 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
+use skein::case::Case;
 use skein::golden::{Config, Machine};
 use skein::isa::{Sreg, Status, NUM_LANES, NUM_WARPS};
+
+const DEFAULT_GMEM_BYTES: usize = 1 << 20;
+const DEFAULT_SMEM_BYTES: usize = 32 * 1024;
+const DEFAULT_MAX_STEPS: usize = 1_000_000;
 
 /// 在黄金模型里跑 IMEM 镜像。
 #[derive(Parser)]
 #[command(name = "skein-run", version, max_term_width = 100)]
 struct Args {
-    /// IMEM 镜像（每条指令 32 位小端）
-    image: PathBuf,
+    /// IMEM 镜像（每条指令 32 位小端）；和 --case 二选一
+    #[arg(value_name = "IMAGE", conflicts_with = "case")]
+    image: Option<PathBuf>,
+
+    /// case 文件（cases/*.toml）：形状、参数、初态都从它来
+    #[arg(long = "case", value_name = "FILE")]
+    case: Option<PathBuf>,
 
     /// 打印每条指令
     #[arg(long)]
@@ -49,15 +59,15 @@ struct Args {
     grid: u32,
 
     /// global memory 大小（字节）
-    #[arg(long, value_name = "BYTES", default_value_t = 1 << 20, value_parser = parse_usize)]
+    #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_GMEM_BYTES, value_parser = parse_usize)]
     gmem_bytes: usize,
 
     /// shared memory 大小（字节）
-    #[arg(long, value_name = "BYTES", default_value_t = 32 * 1024, value_parser = parse_usize)]
+    #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_SMEM_BYTES, value_parser = parse_usize)]
     smem_bytes: usize,
 
     /// 执行步数上限（死循环保护）
-    #[arg(long, value_name = "N", default_value_t = 1_000_000, value_parser = parse_usize)]
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_MAX_STEPS, value_parser = parse_usize)]
     max_steps: usize,
 }
 
@@ -121,20 +131,15 @@ fn parse_sreg(text: &str) -> Result<(Sreg, u32), String> {
         Some(pair) => pair,
         None => return Err(format!("写法应为 NAME=VALUE：{text}")),
     };
-    let name = name.trim().to_uppercase();
-    let name = name.strip_prefix("S_").unwrap_or(&name).to_string();
-    let sreg = match Sreg::from_text(&name) {
+    let sreg = match Sreg::from_name(name) {
         Some(sreg) => sreg,
         None => return Err(format!("不认识的特殊寄存器：{name}")),
     };
-    match sreg {
-        Sreg::PtrA | Sreg::PtrB | Sreg::PtrC | Sreg::Arg0 | Sreg::Arg1 | Sreg::Arg2 => {}
-        _ => {
-            return Err(format!(
-                "{} 是只读的；--set 只能设置 PTR_A/PTR_B/PTR_C/ARG0/ARG1/ARG2",
-                sreg.text()
-            ))
-        }
+    if !sreg.writable() {
+        return Err(format!(
+            "{} 是只读的；--set 只能设置 PTR_A/PTR_B/PTR_C/ARG0/ARG1/ARG2",
+            sreg.text()
+        ));
     }
     let value = parse_number(value.trim())?;
     let value = u32::try_from(value).map_err(|_| format!("值超出 32 位：{text}"))?;
@@ -171,24 +176,81 @@ fn load_image(path: &PathBuf) -> Option<Vec<u32>> {
     Some(words)
 }
 
-fn main() -> ExitCode {
-    let args = Args::parse();
-    let Some(image) = load_image(&args.image) else {
-        return ExitCode::FAILURE;
-    };
-    let config = Config {
+/// 镜像模式下的配置。
+fn config_from_args(args: &Args) -> Config {
+    Config {
         warpsz: args.warpsz.max(1),
         nwarp: args.nwarp.max(1),
         block_dim: args.bdim,
         grid: args.grid,
         smem_bytes: args.smem_bytes.max(4),
         gmem_bytes: args.gmem_bytes.max(4),
-        sregs: args.sregs,
+        sregs: args.sregs.clone(),
         trace: args.trace,
         max_steps: args.max_steps as u64,
-    };
+    }
+}
 
-    let mut machine = Machine::new(image, config);
+/// `--case` 模式下，形状和初态由 case 决定：给了这些选项就直接报错，别让人以为生效了。
+fn case_mode_conflicts(args: &Args) -> Option<&'static str> {
+    let mut conflicts = Vec::new();
+    if !args.sregs.is_empty() {
+        conflicts.push("--set");
+    }
+    if args.bdim.is_some() {
+        conflicts.push("--bdim");
+    }
+    if args.warpsz != NUM_LANES {
+        conflicts.push("--warpsz");
+    }
+    if args.nwarp != NUM_WARPS {
+        conflicts.push("--nwarp");
+    }
+    if args.grid != 1 {
+        conflicts.push("--grid");
+    }
+    if args.gmem_bytes != DEFAULT_GMEM_BYTES {
+        conflicts.push("--gmem-bytes");
+    }
+    if args.smem_bytes != DEFAULT_SMEM_BYTES {
+        conflicts.push("--smem-bytes");
+    }
+    if args.max_steps != DEFAULT_MAX_STEPS {
+        conflicts.push("--max-steps");
+    }
+    conflicts.first().copied()
+}
+
+fn main() -> ExitCode {
+    let args = Args::parse();
+    let mut machine = if let Some(path) = &args.case {
+        if let Some(conflict) = case_mode_conflicts(&args) {
+            eprintln!("--case 模式下形状和初态由 case 文件决定，不要给 {conflict}");
+            return ExitCode::FAILURE;
+        }
+        let case = match Case::load(path) {
+            Ok(case) => case,
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        match case.machine(args.trace) {
+            Ok(machine) => machine,
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if let Some(image) = &args.image {
+        let Some(words) = load_image(image) else {
+            return ExitCode::FAILURE;
+        };
+        Machine::new(words, config_from_args(&args))
+    } else {
+        eprintln!("要么给 IMEM 镜像，要么给 --case <case.toml>");
+        return ExitCode::FAILURE;
+    };
     let status = machine.run();
     if machine.limit_hit {
         eprintln!("执行步数超过上限（死循环？）");

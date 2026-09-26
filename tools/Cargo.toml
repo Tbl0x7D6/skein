@@ -17,3 +17,7 @@ path = "src/bin/skein-run.rs"
 [dependencies]
 # 只用在两个命令行工具的参数解析上；黄金模型本身不依赖它
 clap = { version = "4", features = ["derive"] }
+# case 文件（cases/*.toml）和状态快照的解析；黄金模型本身不依赖它们
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"

@@ -1,0 +1,31 @@
+# matmul：rows = 23，前几个线程要算两行（有分歧）
+program = "matmul.s"
+warpsz = 4
+nwarp = 4
+
+[sreg]
+PTR_A = 0x1000
+PTR_B = 0x2000
+PTR_C = 0x3000
+ARG0 = 23
+
+[[init]]
+space = "gmem"
+addr = 0x1000
+gen = "matmul_a"
+args = { rows = 23 }
+
+[[init]]
+space = "gmem"
+addr = 0x2000
+gen = "matmul_b"
+
+[[check]]
+space = "gmem"
+addr = 0x3000
+words = 368
+
+[expect]
+status = "OK"
+barriers = 1
+max_steps = 29440
