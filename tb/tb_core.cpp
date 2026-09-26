@@ -9,10 +9,13 @@
 //!   tb_core --image <image.bin> [--set NAME=VALUE]...
 //!           [--gmem-init ADDR FILE]... [--smem-init ADDR FILE]...
 //!           [--mem-window SPACE ADDR WORDS]... [--max-cycles N] [--trace]
-//!           [--dump-state <file>]
+//!           [--dump-state <file>] [--dump-wave <file.fst>]
 //!
 //! 形状固定 1 warp × 1 lane（WARPSZ/NWARP/BLOCK_DIM/GRID 都是 1，TID/LANEID/WID/BID
 //! 都是 0）；多 warp / 多 lane 的 case 由 runner 跳过。
+//!
+//! `--dump-wave` 要带波形支持的模型（`make tb-trace` 出来的 `tb_core_trace`），普通
+//! 模型的时序逻辑不带 trace 代码，用它会直接报错。
 
 #include <cctype>
 #include <cstdint>
@@ -20,11 +23,15 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "VSK_core.h"
 #include "verilated.h"
+#if VM_TRACE
+#include "verilated_fst_c.h"
+#endif
 
 namespace {
 
@@ -86,6 +93,7 @@ struct Options {
     std::vector<MemInit> inits;
     std::vector<MemWindow> windows;
     std::string state;
+    std::string wave;
     long max_cycles = 200000;
     bool trace = false;
 };
@@ -94,7 +102,7 @@ void usage() {
     std::cerr << "用法：tb_core --image <image.bin> [--set NAME=VALUE]... "
                  "[--gmem-init ADDR FILE]... [--smem-init ADDR FILE]... "
                  "[--mem-window SPACE ADDR WORDS]... [--max-cycles N] [--trace] "
-                 "[--dump-state <file>]\n";
+                 "[--dump-state <file>] [--dump-wave <file.fst>]\n";
 }
 
 uint32_t parse_number(const std::string& text) {
@@ -186,6 +194,13 @@ bool parse_args(int argc, char** argv, Options& opt) {
         } else if (arg == "--dump-state") {
             if (!need(1)) return false;
             opt.state = argv[++i];
+        } else if (arg == "--dump-wave") {
+            if (!need(1)) return false;
+            opt.wave = argv[++i];
+#if !VM_TRACE
+            std::cerr << "这个模型没编波形：用 `make tb-trace` 出来的 tb_core_trace\n";
+            return false;
+#endif
         } else {
             std::cerr << "不认识的参数：" << arg << "\n";
             return false;
@@ -328,11 +343,33 @@ int main(int argc, char** argv) {
         dut->gmem_rdata_i = (ga <= GMEM_BYTES - 4) ? gmem[ga >> 2] : 0;
         dut->gmem_fault_i = (ga > GMEM_BYTES - 4);
     };
+
+    // 波形：只有 trace 版模型（make tb-trace）才有，每个半周期 dump 一次
+#if VM_TRACE
+    std::unique_ptr<VerilatedFstC> fst;
+    if (!opt.wave.empty()) {
+        Verilated::traceEverOn(true);
+        fst = std::make_unique<VerilatedFstC>();
+        dut->trace(fst.get(), 99);
+        fst->open(opt.wave.c_str());
+    }
+    vluint64_t wave_time = 0;
+    auto dump_wave = [&]() {
+        if (fst) {
+            fst->dump(wave_time);
+        }
+        wave_time++;
+    };
+#else
+    auto dump_wave = []() {};
+#endif
+
     auto low_phase = [&]() {
         dut->clk = 0;
         dut->eval();
         drive_memory();
         dut->eval();
+        dump_wave();
     };
     auto clock_edge = [&]() {
         bool smem_we = dut->smem_we_o, gmem_we = dut->gmem_we_o;
@@ -346,6 +383,7 @@ int main(int argc, char** argv) {
         if (gmem_we && ga <= GMEM_BYTES - 4) {
             gmem[ga >> 2] = gd;
         }
+        dump_wave();
     };
     auto tick = [&]() {
         low_phase();
@@ -414,5 +452,10 @@ int main(int argc, char** argv) {
         std::cerr << opt.image << ": " << cycles << " 拍还没结束（status=" << status << "）\n";
         return 1;
     }
+#if VM_TRACE
+    if (fst) {
+        fst->close();
+    }
+#endif
     return 0;
 }

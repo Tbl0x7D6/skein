@@ -248,8 +248,11 @@ max_steps = 20480
   并注明原因，最后打印 PASS/SKIP/FAIL 计数。
 - `make test` 里的 `tests/cases.rs` 不依赖 Verilator：每个 case 都跑一遍黄金模型并检查
   `[expect]`，保证 case 本身是有效的测试。
-- 调试单个 case：`cargo run --bin skein-run -- --case cases/directed/sum.toml --trace`，
-  RTL 侧 `build/obj_core/tb_core --image … --dump-state state.json` 看快照。
+- 调试单个 case：`cargo run --bin skein-run -- --case cases/directed/sum.toml --trace`；
+  RTL 侧 `build/obj_core/tb_core --image … --dump-state state.json` 看状态快照。
+- 看波形：`make wave CASE=cases/directed/sum.toml` 直接跑一个 case 并把 FST 写到
+  `build/sum.fst`（`WAVE=` 改路径）；要手动跑单个 bin，就用 `make tb-trace` 出来的
+  `build/obj_core_trace/tb_core_trace --dump-wave out.fst`。FST 用 GTKWave 打开。
 
 ### 黄金模型
 

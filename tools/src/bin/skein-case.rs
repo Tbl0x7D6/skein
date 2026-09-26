@@ -36,6 +36,11 @@ struct Args {
     /// 临时文件目录：镜像、初态和 RTL 的状态 dump 都放这里
     #[arg(long, value_name = "DIR", default_value = "build/cases")]
     work_dir: PathBuf,
+
+    /// 把 RTL 波形（FST）写到这个文件；一次只跑一个 case，
+    /// 而且要配带波形的模型（--rtl-tb 指向 make tb-trace 出来的 tb_core_trace）
+    #[arg(long, value_name = "FILE")]
+    wave: Option<PathBuf>,
 }
 
 /// `tb_core --dump-state` 写出来的状态快照。
@@ -65,7 +70,7 @@ struct SnapshotWindow {
 }
 
 enum Outcome {
-    Pass { cycles: u64 },
+    Pass { cycles: u64, wave: Option<PathBuf> },
     Skip { reason: String },
 }
 
@@ -91,6 +96,14 @@ fn main() -> ExitCode {
         eprintln!("没有匹配的 case");
         return ExitCode::FAILURE;
     }
+    if args.wave.is_some() && args.rtl_tb.is_none() {
+        eprintln!("--wave 需要 --rtl-tb 指向带波形的模型（make tb-trace 出来的 tb_core_trace）");
+        return ExitCode::FAILURE;
+    }
+    if args.wave.is_some() && cases.len() != 1 {
+        eprintln!("--wave 一次只能跑一个 case，现在匹配到 {} 个", cases.len());
+        return ExitCode::FAILURE;
+    }
 
     let (mut passed, mut skipped, mut failed) = (0usize, 0usize, 0usize);
     let width = cases
@@ -100,9 +113,16 @@ fn main() -> ExitCode {
         .unwrap_or(0);
     for case in &cases {
         match run(case, &args) {
-            Ok(Outcome::Pass { cycles }) => {
+            Ok(Outcome::Pass { cycles, wave }) => {
                 passed += 1;
-                println!("{:<width$} PASS  cycles={cycles}", case.name);
+                match wave {
+                    Some(path) => println!(
+                        "{:<width$} PASS  cycles={cycles}  wave={}",
+                        case.name,
+                        path.display()
+                    ),
+                    None => println!("{:<width$} PASS  cycles={cycles}", case.name),
+                }
             }
             Ok(Outcome::Skip { reason }) => {
                 skipped += 1;
@@ -165,12 +185,17 @@ fn run(case: &Case, args: &Args) -> Result<Outcome, Vec<String>> {
         .materialize_rtl(&args.work_dir)
         .map_err(|err| vec![err])?;
     let state_path = case.work_dir(&args.work_dir).join("state.json");
-    let output = Command::new(tb)
+    let mut command = Command::new(tb);
+    command
         .args(&input.args)
         .arg("--dump-state")
         .arg(&state_path)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(wave) = &args.wave {
+        command.arg("--dump-wave").arg(wave);
+    }
+    let output = command
         .output()
         .map_err(|err| vec![format!("调用 {} 失败：{err}", tb.display())])?;
     if !output.status.success() {
@@ -195,6 +220,7 @@ fn run(case: &Case, args: &Args) -> Result<Outcome, Vec<String>> {
     if problems.is_empty() {
         Ok(Outcome::Pass {
             cycles: snapshot.cycles,
+            wave: args.wave.clone(),
         })
     } else {
         Err(problems)

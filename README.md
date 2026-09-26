@@ -16,6 +16,8 @@ make asm SRC=cases/kernels/vecadd/vecadd.s                       # 汇编成 bui
 make sim SRC=cases/kernels/vecadd/vecadd.s ARGS="--trace"        # 在黄金模型里跑
 make sim SRC=cases/kernels/vecadd/vecadd.s ARGS="--help"         # 两个工具的完整选项（clap 生成）
 make rtl-sim                                                    # 把 cases/ 逐个送进 RTL 和黄金模型对拍
+make tb-trace                                                   # 编译带 FST 波形的模型（手动跑 tb_core_trace）
+make wave CASE=cases/directed/sum.toml                          # 跑单个 case，波形 dump 到 build/sum.fst
 make regress                                                    # 上面全跑一遍：fmt + clippy + test + lint + 仿真
 ```
 
