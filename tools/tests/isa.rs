@@ -818,3 +818,22 @@ fn error_pc_out_of_range() {
     let m = run("NOP"); // 没有 EXIT，跑出 IMEM
     assert_eq!(m.status, Status::PcOob);
 }
+
+#[test]
+fn writes_to_r0_are_dropped() {
+    // r0 恒为 0：任何写 r0 都被丢弃（RTL 的寄存器堆也这么干），读出来永远是 0
+    let m = run("
+            LI    r1, 7
+            MOV   r0, r1              ; 普通 ALU 写 r0
+            LI    r2, 0x100
+            ADD   r0, r2, r2          ; 读改写 r0
+            FMA   r0, r2, r2          ; rd 既读又写，也一样丢弃
+            MSAVE r0                  ; warp 级 mask 指令写 r0
+            SREAD r0, S_TID           ; 特殊寄存器写 r0
+            ADD   r3, r0, r1          ; 读 r0 = 0 -> r3 = 7
+            EXIT
+    ");
+    assert_eq!(m.status, Status::Ok);
+    assert_eq!(gprs(&m, 0, 0), [0, 0, 0, 0]);
+    assert_eq!(gprs(&m, 3, 0), [7; 4]);
+}

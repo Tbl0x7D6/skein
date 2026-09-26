@@ -335,6 +335,13 @@ impl Machine {
         }
     }
 
+    /// 一条 lane 的 GPR 写回。`r0` 恒为 0：写 `r0` 被丢弃，和 RTL 的寄存器堆一致。
+    fn wb(&mut self, wid: usize, lane: usize, reg: u32, value: u32) {
+        if reg != 0 {
+            self.warps[wid].gpr[lane][reg as usize] = value;
+        }
+    }
+
     fn execute(&mut self, wid: usize, pc: usize, insn: &Insn) {
         match insn.op {
             OP_RALU => {
@@ -345,7 +352,8 @@ impl Machine {
                     let acc = self.warps[wid].gpr[lane][insn.rd as usize];
                     let a = self.warps[wid].gpr[lane][insn.ra as usize];
                     let b = self.warps[wid].gpr[lane][insn.rb as usize];
-                    self.warps[wid].gpr[lane][insn.rd as usize] = ralu_exec(op, acc, a, b);
+                    let value = ralu_exec(op, acc, a, b);
+                    self.wb(wid, lane, insn.rd, value);
                 }
             }
             op if is_cmp_op(op) => {
@@ -380,13 +388,14 @@ impl Machine {
                     } else {
                         self.warps[wid].gpr[lane][rb]
                     };
-                    self.warps[wid].gpr[lane][insn.rd as usize] = value;
+                    self.wb(wid, lane, insn.rd, value);
                 }
             }
             OP_ADDI | OP_ANDI | OP_ORI | OP_SHLI | OP_SLTI | OP_LUI | OP_LUM => {
                 for lane in self.lanes(wid, insn, true) {
                     let a = self.warps[wid].gpr[lane][insn.ra as usize];
-                    self.warps[wid].gpr[lane][insn.rd as usize] = imm_exec(insn, a);
+                    let value = imm_exec(insn, a);
+                    self.wb(wid, lane, insn.rd, value);
                 }
             }
             OP_LDS | OP_LDG => {
@@ -399,7 +408,8 @@ impl Machine {
                     return;
                 };
                 for (lane, addr) in addrs {
-                    self.warps[wid].gpr[lane][insn.rd as usize] = self.read_word(space, addr);
+                    let value = self.read_word(space, addr);
+                    self.wb(wid, lane, insn.rd, value);
                 }
             }
             OP_STS | OP_STG => {
@@ -433,7 +443,7 @@ impl Machine {
                 };
                 for lane in self.lanes(wid, insn, true) {
                     let value = self.read_sreg(wid, lane, sreg);
-                    self.warps[wid].gpr[lane][insn.rd as usize] = value;
+                    self.wb(wid, lane, insn.rd, value);
                 }
             }
             OP_SHFL => {
@@ -461,7 +471,7 @@ impl Machine {
                         Some(src) if (m >> src) & 1 == 1 => source[src],
                         _ => source[lane],
                     };
-                    self.warps[wid].gpr[lane][rd] = value;
+                    self.wb(wid, lane, rd as u32, value);
                 }
             }
             OP_VOTE => {
@@ -479,7 +489,7 @@ impl Machine {
                 };
                 // warp 级指令：结果写所有 lane，BRZ/BRNZ 读 lane 0 也拿得到
                 for lane in 0..self.warpsz {
-                    self.warps[wid].gpr[lane][insn.rd as usize] = value;
+                    self.wb(wid, lane, insn.rd, value);
                 }
             }
             OP_SYS => self.sys_op(wid, insn),
@@ -584,7 +594,7 @@ impl Machine {
         } & full;
         // mask 指令是 warp 级操作，不受 M 门控：写所有 lane
         for lane in 0..self.warpsz {
-            self.warps[wid].gpr[lane][rd] = value;
+            self.wb(wid, lane, rd as u32, value);
         }
         // `.PM`：rd 和 M 同拍更新（上面算结果时读的还是旧 M）
         if op.writes_mask() {
