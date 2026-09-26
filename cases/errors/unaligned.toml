@@ -1,0 +1,11 @@
+# 非对齐访问：错误路径的契约只有 STATUS 和 PC
+program = "unaligned.s"
+warpsz = 4
+nwarp = 1
+block_dim = 4
+
+[sreg]
+PTR_A = 0x1000
+
+[expect]
+status = "UNALIGNED"

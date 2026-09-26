@@ -1,7 +1,11 @@
 //! skein-case：把 `cases/*.toml` 同时送进黄金模型和 RTL testbench，逐项比对。
 //!
 //! 黄金模型在进程里跑；RTL 由 Verilator 的 `tb_core` 跑，它只负责喂输入、dump 状态，
-//! 比对逻辑都在这里。形状不支持的 case（多 warp / 多 lane）只跑黄金模型，报 SKIP。
+//! 比对逻辑都在这里。形状不支持的 case（多 warp / 多 block）只跑黄金模型，报 SKIP；
+//! 形状由 `tb_core --print-shape` 自报，所以这里不写死 lane 数。
+//!
+//! 黄金模型报错（status != OK）时只比 status 和 pc：出错之后哪些 lane / 哪些存储已经
+//! 生效属于实现行为，不是架构契约（见 docs/design.md §5.5），逐字节比只会得到假 FAIL。
 //!
 //! 用法见 `skein-case --help`；`make rtl-sim` 会先建好模型再调它。
 
@@ -11,7 +15,7 @@ use std::process::{Command, ExitCode, Stdio};
 use clap::Parser;
 use serde::Deserialize;
 
-use skein::case::Case;
+use skein::case::{Case, RtlShape};
 use skein::golden::Machine;
 use skein::isa::Status;
 
@@ -70,21 +74,43 @@ struct SnapshotWindow {
 }
 
 enum Outcome {
-    Pass { cycles: u64, wave: Option<PathBuf> },
-    Skip { reason: String },
+    Pass {
+        cycles: u64,
+        wave: Option<PathBuf>,
+        limited: bool,
+    },
+    Skip {
+        reason: String,
+    },
 }
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    if let Some(tb) = &args.rtl_tb {
-        if !tb.is_file() {
-            eprintln!(
-                "找不到 RTL testbench：{}（先 make rtl-sim 或者给出正确路径）",
-                tb.display()
-            );
-            return ExitCode::FAILURE;
+    let shape = match &args.rtl_tb {
+        Some(tb) => {
+            if !tb.is_file() {
+                eprintln!(
+                    "找不到 RTL testbench：{}（先 make rtl-sim 或者给出正确路径）",
+                    tb.display()
+                );
+                return ExitCode::FAILURE;
+            }
+            match probe_shape(tb) {
+                Ok(shape) => {
+                    println!(
+                        "RTL 形状：{} lane/warp，最多 {} 个线程/block，{} 个 block",
+                        shape.warpsz, shape.max_block_dim, shape.max_grid
+                    );
+                    Some(shape)
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    return ExitCode::FAILURE;
+                }
+            }
         }
-    }
+        None => None,
+    };
     let cases = match collect(&args.paths, args.filter.as_deref()) {
         Ok(cases) => cases,
         Err(err) => {
@@ -112,16 +138,21 @@ fn main() -> ExitCode {
         .max()
         .unwrap_or(0);
     for case in &cases {
-        match run(case, &args) {
-            Ok(Outcome::Pass { cycles, wave }) => {
+        match run(case, &args, shape.as_ref()) {
+            Ok(Outcome::Pass {
+                cycles,
+                wave,
+                limited,
+            }) => {
                 passed += 1;
+                let note = if limited { "  只比 status/pc" } else { "" };
                 match wave {
                     Some(path) => println!(
-                        "{:<width$} PASS  cycles={cycles}  wave={}",
+                        "{:<width$} PASS  cycles={cycles}  wave={}{note}",
                         case.name,
                         path.display()
                     ),
-                    None => println!("{:<width$} PASS  cycles={cycles}", case.name),
+                    None => println!("{:<width$} PASS  cycles={cycles}{note}", case.name),
                 }
             }
             Ok(Outcome::Skip { reason }) => {
@@ -165,21 +196,42 @@ fn collect(paths: &[PathBuf], filter: Option<&str>) -> Result<Vec<Case>, String>
     Ok(cases)
 }
 
-fn run(case: &Case, args: &Args) -> Result<Outcome, Vec<String>> {
+/// 问一次 testbench 的形状：`tb_core --print-shape` 打一行 JSON。
+fn probe_shape(tb: &PathBuf) -> Result<RtlShape, String> {
+    let output = Command::new(tb)
+        .arg("--print-shape")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| format!("调用 {} --print-shape 失败：{err}", tb.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} --print-shape 失败（退出码 {}）：{}",
+            tb.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(text.trim())
+        .map_err(|err| format!("{} --print-shape 的输出不是形状 JSON：{err}", tb.display()))
+}
+
+fn run(case: &Case, args: &Args, shape: Option<&RtlShape>) -> Result<Outcome, Vec<String>> {
     let mut machine = case.machine(false).map_err(|err| vec![err])?;
     machine.run();
     let golden_problems = case.check_golden(&machine);
     if !golden_problems.is_empty() {
         return Err(golden_problems);
     }
-    if let Err(reason) = case.rtl_eligible() {
-        return Ok(Outcome::Skip { reason });
-    }
-    let Some(tb) = &args.rtl_tb else {
+    let (Some(tb), Some(shape)) = (&args.rtl_tb, shape) else {
         return Ok(Outcome::Skip {
             reason: "没给 --rtl-tb，只跑了黄金模型".to_string(),
         });
     };
+    if let Err(reason) = case.rtl_eligible(shape) {
+        return Ok(Outcome::Skip { reason });
+    }
 
     let input = case
         .materialize_rtl(&args.work_dir)
@@ -217,10 +269,12 @@ fn run(case: &Case, args: &Args) -> Result<Outcome, Vec<String>> {
     let windows = case.read_windows(&machine).map_err(|err| vec![err])?;
 
     let problems = compare(&machine, &windows, &snapshot);
+    let limited = machine.status != Status::Ok;
     if problems.is_empty() {
         Ok(Outcome::Pass {
             cycles: snapshot.cycles,
             wave: args.wave.clone(),
+            limited,
         })
     } else {
         Err(problems)
@@ -228,6 +282,9 @@ fn run(case: &Case, args: &Args) -> Result<Outcome, Vec<String>> {
 }
 
 /// RTL 的快照 vs 黄金模型：状态、warp 0 的 pc/M/GPR/谓词，加上 case 声明的内存窗口。
+///
+/// 黄金模型报错时只比 status 和 pc——出错之后哪些 lane 已经提交、内存写进去多少都属于
+/// 实现行为（docs/design.md §5.5），不是架构契约；比下去只会得到假 FAIL。
 fn compare(golden: &Machine, windows: &[Vec<u32>], rtl: &Snapshot) -> Vec<String> {
     let mut problems = Vec::new();
     let want_status = golden.status;
@@ -251,6 +308,9 @@ fn compare(golden: &Machine, windows: &[Vec<u32>], rtl: &Snapshot) -> Vec<String
     let want_warp = &golden.warps[0];
     if warp.pc as usize != want_warp.pc {
         problems.push(format!("pc 期望 {}，实际 {}", want_warp.pc, warp.pc));
+    }
+    if golden.status != Status::Ok {
+        return problems;
     }
     if warp.m != want_warp.m {
         problems.push(format!("M 期望 {:#x}，实际 {:#x}", want_warp.m, warp.m));

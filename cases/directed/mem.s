@@ -1,4 +1,4 @@
-; P1：shared/global 读写、立即数偏移，最后用一条非对齐访问检查 UNALIGNED 错误码
+; 定向：shared/global 读写和立即数偏移（单 warp × 4 lane，地址全 lane 一致）
 
         LI      r1, 64                  ; shared 字节地址
         LI      r2, 0x12345678
@@ -16,6 +16,4 @@
         SREAD   r9, S_PTR_A             ; --set PTR_A=0x1000
         STG     [r9], r5
         LDG     r10, [r9]
-
-        LDG     r11, [r9+2]             ; 非对齐 -> STATUS = UNALIGNED，在这里结束
         EXIT

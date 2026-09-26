@@ -2,7 +2,9 @@
 //!
 //! 越界由存储侧报（`*_fault_i`：片上存储知道自己的容量，片外由 AXI 从设备报错），
 //! 对齐由这里查；先报对齐再报越界，和黄金模型的顺序一致（docs/design.md §5.5）。
-//! P1 是阻塞式访问：数据同一拍回来，没有 scoreboard。
+//!
+//! 这里只做一条 lane 的一次访问（纯组合）：`SK_core` 用 N 拍的计数器逐 lane 调用它，
+//! 数据同一拍回来，没有 scoreboard。P5 要在这里加合并（coalescer）。
 
 module SK_lsu (
     input  logic        op_en_i,      // 本条指令是访存而且本拍有效（lane 活跃）

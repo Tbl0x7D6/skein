@@ -294,10 +294,15 @@ fn matmul_reference(rows: usize, a: &[i32], b: &[i32]) -> Vec<i32> {
 
 #[test]
 fn matmul_multi_warp() {
-    // 4 warp x 4 lane 协作把 A、B 搬进 shared，BAR 之后每个线程算自己认领的行。
-    // rows = 16 时每线程正好一行（无分歧）；rows = 23 时前几个线程要算两行（有分歧）。
-    // BAR 次数和步数上界写在 case 的 [expect] 里，由 tests/cases.rs 统一检查。
-    for name in ["kernels/matmul/rows16", "kernels/matmul/rows23"] {
+    // 把 A、B 搬进 shared，BAR 之后每个线程算自己认领的行。
+    // rows = 4 是单 warp × 4 lane（RTL 也跑）；16 是 4 warp × 4 lane、每线程正好一行；
+    // 23 时前几个线程要算两行（有分歧）。BAR 次数和步数上界写在 case 的 [expect] 里，
+    // 由 tests/cases.rs 统一检查。
+    for name in [
+        "kernels/matmul/rows4",
+        "kernels/matmul/rows16",
+        "kernels/matmul/rows23",
+    ] {
         let (case, machine) = run_case(name);
         assert_eq!(machine.status, Status::Ok, "{name}");
         check_matmul(&case, &machine);

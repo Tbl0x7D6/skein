@@ -1,4 +1,4 @@
-; P1：sum = 0 + 1 + ... + 9 = 45
+; 定向：sum = 0 + 1 + ... + 9 = 45
 ; 循环用 docs/design.md §6.3 的 mask 模板：r24 = 循环外的 mask，r25 = 继续 mask
 
         LI      r1, 0                   ; i

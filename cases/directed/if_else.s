@@ -1,4 +1,4 @@
-; P1：IF/ELSE 的手写 mask 序列（docs/design.md §6.2），条件成立、不成立各一次
+; 定向：IF/ELSE 的手写 mask 序列（docs/design.md §6.2），条件成立、不成立各一次
 
         LI      r1, 1
         LI      r2, 2

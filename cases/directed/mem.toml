@@ -1,11 +1,11 @@
-# P1：shared/global 读写和立即数偏移，最后一条非对齐访问结束 kernel
+# 定向：shared/global 读写和立即数偏移（单 warp × 4 lane，地址全 lane 一致）
 program = "mem.s"
-warpsz = 1
+warpsz = 4
 nwarp = 1
-block_dim = 1
+block_dim = 4
 
 [sreg]
 PTR_A = 0x1000
 
 [expect]
-status = "UNALIGNED"
+status = "OK"

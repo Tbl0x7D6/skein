@@ -67,11 +67,20 @@ package SK_pkg;
     /// 系统指令的 func。
     localparam logic [3:0] SK_SYS_NOP = 4'd0, SK_SYS_BAR = 4'd1, SK_SYS_EXIT = 4'd2;
 
+    /// SHFL 的 func。
+    localparam logic [3:0] SK_SHFL_IDX  = 4'd0, SK_SHFL_UP = 4'd1,
+                           SK_SHFL_DOWN = 4'd2, SK_SHFL_BFLY = 4'd3;
+
     /// VOTE 的 func。
     localparam logic [3:0] SK_VOTE_ANY = 4'd0, SK_VOTE_ALL = 4'd1;
 
-    /// 特殊寄存器编号的上限（0=TID … 14=BLOCK_DIM，15 保留）。
-    localparam logic [4:0] SK_SREG_MAX = 5'd14;
+    /// 特殊寄存器编号（和 tools/src/isa.rs 的 Sreg 同码）；15 保留。
+    /// 单个编号是数组下标（4 位），`SK_SREG_MAX` 要和译码里的 5 位 `ra` 比，所以是 5 位。
+    localparam logic [3:0] SK_SREG_TID    = 4'd0,
+                           SK_SREG_LANEID = 4'd1,
+                           SK_SREG_WID    = 4'd2,
+                           SK_SREG_WARPSZ = 4'd3;
+    localparam logic [4:0] SK_SREG_MAX    = 5'd14;
 
     /// 译码结果：执行级的全部控制信号。
     typedef struct packed {

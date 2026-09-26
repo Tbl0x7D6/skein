@@ -1,8 +1,8 @@
-# vecadd 的单 lane 版本：RTL 今天就能端到端跑（含初态和输出窗口比对）
+# vecadd 的单 warp 版本：4 lane、n = 4，每个 lane 一个元素（RTL 端到端跑）
 program = "vecadd.s"
-warpsz = 1
+warpsz = 4
 nwarp = 1
-block_dim = 1
+block_dim = 4
 
 [sreg]
 PTR_A = 0x1000

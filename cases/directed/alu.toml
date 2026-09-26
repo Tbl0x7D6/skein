@@ -1,8 +1,8 @@
-# P1：算术、立即数、谓词组合修饰和 @p/@!p 门控
+# 定向：算术、立即数、谓词组合修饰和 @p/@!p 门控（单 warp × 4 lane）
 program = "alu.s"
-warpsz = 1
+warpsz = 4
 nwarp = 1
-block_dim = 1
+block_dim = 4
 
 [expect]
 status = "OK"

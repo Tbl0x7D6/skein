@@ -1,8 +1,8 @@
 # 保留编码：0x3B 是类 11_1 的空子码，汇编器不给编，直接给指令字
 words = [0x3b, 0x3a]
-warpsz = 1
+warpsz = 4
 nwarp = 1
-block_dim = 1
+block_dim = 4
 
 [expect]
 status = "BAD_INSN"

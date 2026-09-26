@@ -1,4 +1,4 @@
-//! P1 单 lane 核的 Verilator testbench：喂输入、跑到底、dump 状态。
+//! 单 warp 核的 Verilator testbench：喂输入、跑到底、dump 状态。
 //!
 //! 这里不做比对——`skein-case`（tools/src/bin/skein-case.rs）把这份 dump 和黄金模型逐项
 //! 比对。testbench 只负责：装载 IMEM 镜像和 shared/global 初态、驱动特殊寄存器、
@@ -10,9 +10,12 @@
 //!           [--gmem-init ADDR FILE]... [--smem-init ADDR FILE]...
 //!           [--mem-window SPACE ADDR WORDS]... [--max-cycles N] [--trace]
 //!           [--dump-state <file>] [--dump-wave <file.fst>]
+//!   tb_core --print-shape                      # 只打印核的形状，不跑
 //!
-//! 形状固定 1 warp × 1 lane（WARPSZ/NWARP/BLOCK_DIM/GRID 都是 1，TID/LANEID/WID/BID
-//! 都是 0）；多 warp / 多 lane 的 case 由 runner 跳过。
+//! 形状来自核的 `shape_o`：warp 大小是 `SK_NUM_LANES` 个 lane，一次启动只激活 1 条
+//! warp（P2；多 warp 在 P3）。`skein-case` 先用 `--print-shape` 探形状，超过这个形状的
+//! case 报 SKIP。`WARPSZ = SK_NUM_LANES`、`BLOCK_DIM = WARPSZ`、`NWARP = GRID = 1`、
+//! `BID = WID = 0`，`TID/LANEID` 由核按 lane 算。
 //!
 //! `--dump-wave` 要带波形支持的模型（`make tb-trace` 出来的 `tb_core_trace`），普通
 //! 模型的时序逻辑不带 trace 代码，用它会直接报错。
@@ -68,6 +71,13 @@ constexpr int SREG_BLOCK_DIM = 0x0E;
 constexpr int NUM_GPR = 32;
 constexpr int NUM_PRED = 8;
 
+/// 核的形状：warp 大小、一次启动的 block 容量、block 数容量（来自 `SK_core.shape_o`）。
+struct Shape {
+    uint32_t warpsz = 1;
+    uint32_t max_block_dim = 1;
+    uint32_t max_grid = 1;
+};
+
 struct SregValue {
     int index = 0;
     uint32_t value = 0;
@@ -96,13 +106,15 @@ struct Options {
     std::string wave;
     long max_cycles = 200000;
     bool trace = false;
+    bool print_shape = false;
 };
 
 void usage() {
     std::cerr << "用法：tb_core --image <image.bin> [--set NAME=VALUE]... "
                  "[--gmem-init ADDR FILE]... [--smem-init ADDR FILE]... "
                  "[--mem-window SPACE ADDR WORDS]... [--max-cycles N] [--trace] "
-                 "[--dump-state <file>] [--dump-wave <file.fst>]\n";
+                 "[--dump-state <file>] [--dump-wave <file.fst>]\n"
+                 "       tb_core --print-shape\n";
 }
 
 uint32_t parse_number(const std::string& text) {
@@ -191,6 +203,8 @@ bool parse_args(int argc, char** argv, Options& opt) {
             opt.max_cycles = strtol(argv[++i], nullptr, 0);
         } else if (arg == "--trace") {
             opt.trace = true;
+        } else if (arg == "--print-shape") {
+            opt.print_shape = true;
         } else if (arg == "--dump-state") {
             if (!need(1)) return false;
             opt.state = argv[++i];
@@ -206,7 +220,7 @@ bool parse_args(int argc, char** argv, Options& opt) {
             return false;
         }
     }
-    if (opt.image.empty()) {
+    if (opt.image.empty() && !opt.print_shape) {
         usage();
         return false;
     }
@@ -253,9 +267,11 @@ bool apply_init(const MemInit& init, std::vector<uint32_t>& smem, std::vector<ui
 }
 
 /// 状态 + 内存窗口写成 JSON（形状对齐 skein-run --dump-state）。
-bool write_state(const Options& opt, uint32_t status, long cycles, const std::vector<uint32_t>& gpr,
-                 uint32_t pred, uint32_t m, uint32_t pc, const std::vector<uint32_t>& smem,
-                 const std::vector<uint32_t>& gmem) {
+/// `gpr[lane][reg]`、`pred[lane]` 是每 lane 一份，`m` 是 N 位执行 mask。
+bool write_state(const Options& opt, const Shape& shape, uint32_t status, long cycles,
+                 const std::vector<std::vector<uint32_t>>& gpr,
+                 const std::vector<uint32_t>& pred, uint32_t m, uint32_t pc,
+                 const std::vector<uint32_t>& smem, const std::vector<uint32_t>& gmem) {
     std::ofstream out(opt.state);
     if (!out) {
         std::cerr << "写不了 " << opt.state << "\n";
@@ -264,17 +280,26 @@ bool write_state(const Options& opt, uint32_t status, long cycles, const std::ve
     out << "{\n";
     out << "  \"status\": " << status << ",\n";
     out << "  \"cycles\": " << cycles << ",\n";
+    out << "  \"warpsz\": " << shape.warpsz << ",\n";
     out << "  \"warps\": [\n";
     out << "    {\n      \"wid\": 0,\n      \"pc\": " << pc << ",\n      \"m\": " << m << ",\n";
-    out << "      \"gpr\": [[";
-    for (size_t i = 0; i < gpr.size(); i++) {
-        out << (i ? ", " : "") << gpr[i];
+    out << "      \"gpr\": [";
+    for (size_t lane = 0; lane < gpr.size(); lane++) {
+        out << (lane ? ", [" : "[");
+        for (size_t reg = 0; reg < gpr[lane].size(); reg++) {
+            out << (reg ? ", " : "") << gpr[lane][reg];
+        }
+        out << "]";
     }
-    out << "]],\n      \"pred\": [[";
-    for (int i = 0; i < NUM_PRED; i++) {
-        out << (i ? ", " : "") << ((pred >> i) & 1u);
+    out << "],\n      \"pred\": [";
+    for (size_t lane = 0; lane < pred.size(); lane++) {
+        out << (lane ? ", [" : "[");
+        for (int i = 0; i < NUM_PRED; i++) {
+            out << (i ? ", " : "") << ((pred[lane] >> i) & 1u);
+        }
+        out << "]";
     }
-    out << "]]\n    }\n  ],\n";
+    out << "]\n    }\n  ],\n";
     out << "  \"mem\": [\n";
     for (size_t index = 0; index < opt.windows.size(); index++) {
         const MemWindow& window = opt.windows[index];
@@ -297,14 +322,54 @@ int main(int argc, char** argv) {
     if (!parse_args(argc, argv, opt)) {
         return 2;
     }
-    std::vector<uint32_t> image;
-    if (!load_words(opt.image, image)) {
-        return 2;
-    }
 
     VerilatedContext context;
     context.commandArgs(argc, argv);
     VSK_core* dut = new VSK_core{&context};
+
+    // 复位状态 + 特殊寄存器：形状来自核自己（shape_o），不在这里再写一份常量
+    dut->clk = 0;
+    dut->aresetn = 0;
+    dut->start_i = 0;
+    dut->imem_we_i = 0;
+    dut->imem_addr_i = 0;
+    dut->imem_wdata_i = 0;
+    dut->dbg_addr_i = 0;
+    dut->dbg_lane_i = 0;
+    for (int i = 0; i < 16; i++) {
+        dut->sreg_i[i] = 0;
+    }
+    dut->eval();
+
+    Shape shape;
+    shape.warpsz = dut->shape_o & 0xffu;
+    shape.max_block_dim = shape.warpsz;   // P2：一次只有 1 条 warp（P3 接调度器后放宽）
+    shape.max_grid = 1;                   // P2：一个 block
+    if (shape.warpsz == 0) {
+        std::cerr << "核报了 warpsz = 0\n";
+        return 2;
+    }
+    if (opt.print_shape) {
+        printf("{\"warpsz\": %u, \"max_block_dim\": %u, \"max_grid\": %u}\n", shape.warpsz,
+               shape.max_block_dim, shape.max_grid);
+        delete dut;
+        return 0;
+    }
+
+    // WARPSZ = 硬件 warp 大小，BLOCK_DIM = 一条满 warp，NWARP = GRID = 1，BID = WID = 0；
+    // TID/LANEID 由核按 lane 算
+    dut->sreg_i[SREG_WARPSZ] = shape.warpsz;
+    dut->sreg_i[SREG_NWARP] = 1;
+    dut->sreg_i[SREG_BLOCK_DIM] = shape.max_block_dim;
+    dut->sreg_i[SREG_GRID] = 1;
+    for (const SregValue& sreg : opt.sregs) {
+        dut->sreg_i[sreg.index] = sreg.value;
+    }
+
+    std::vector<uint32_t> image;
+    if (!load_words(opt.image, image)) {
+        return 2;
+    }
 
     std::vector<uint32_t> smem(SMEM_BYTES / 4, 0);
     std::vector<uint32_t> gmem(GMEM_BYTES / 4, 0);
@@ -321,18 +386,6 @@ int main(int argc, char** argv) {
                       << " 越界或者没对齐\n";
             return 2;
         }
-    }
-
-    // 单 lane：WARPSZ/NWARP/BLOCK_DIM/GRID 都是 1，TID/LANEID/WID/BID 都是 0
-    for (int i = 0; i < 16; i++) {
-        dut->sreg_i[i] = 0;
-    }
-    dut->sreg_i[SREG_WARPSZ] = 1;
-    dut->sreg_i[SREG_NWARP] = 1;
-    dut->sreg_i[SREG_BLOCK_DIM] = 1;
-    dut->sreg_i[SREG_GRID] = 1;
-    for (const SregValue& sreg : opt.sregs) {
-        dut->sreg_i[sreg.index] = sreg.value;
     }
 
     auto drive_memory = [&]() {
@@ -396,13 +449,6 @@ int main(int argc, char** argv) {
     };
 
     // 复位
-    dut->clk = 0;
-    dut->aresetn = 0;
-    dut->start_i = 0;
-    dut->imem_we_i = 0;
-    dut->imem_addr_i = 0;
-    dut->imem_wdata_i = 0;
-    dut->dbg_addr_i = 0;
     for (int i = 0; i < 4; i++) {
         tick();
     }
@@ -427,24 +473,29 @@ int main(int argc, char** argv) {
     while (!dut->done_o && cycles < opt.max_cycles) {
         low_phase();
         if (opt.trace && (dbg(DBG_RUN) & 1u)) {
-            printf("cyc=%-4ld pc=%04x insn=%08x m=%u\n", cycles, dbg(DBG_PC_E), dbg(DBG_INSN),
-                   dbg(DBG_M) & 1u);
+            printf("cyc=%-4ld pc=%04x insn=%08x m=%02x\n", cycles, dbg(DBG_PC_E), dbg(DBG_INSN),
+                   dbg(DBG_M));
         }
         clock_edge();
         cycles++;
     }
 
-    std::vector<uint32_t> gpr;
-    for (int i = 0; i < NUM_GPR; i++) {
-        gpr.push_back(dbg((uint8_t)i));
+    // 按 lane 扫一遍：GPR 和谓词都是每 lane 一份，M 是 N 位
+    std::vector<std::vector<uint32_t>> gpr(shape.warpsz);
+    std::vector<uint32_t> pred(shape.warpsz, 0);
+    for (uint32_t lane = 0; lane < shape.warpsz; lane++) {
+        dut->dbg_lane_i = lane;
+        for (int i = 0; i < NUM_GPR; i++) {
+            gpr[lane].push_back(dbg((uint8_t)i));
+        }
+        pred[lane] = dbg(DBG_PRED);
     }
     uint32_t status = dbg(DBG_STATUS);
     uint32_t m = dbg(DBG_M);
-    uint32_t pred = dbg(DBG_PRED);
     uint32_t pc = dbg(DBG_PC_ARCH);
 
     if (!opt.state.empty()) {
-        if (!write_state(opt, status, cycles, gpr, pred, m, pc, smem, gmem)) {
+        if (!write_state(opt, shape, status, cycles, gpr, pred, m, pc, smem, gmem)) {
             return 2;
         }
     }

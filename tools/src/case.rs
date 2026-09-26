@@ -99,6 +99,17 @@ pub struct Case {
     pub spec: Spec,
 }
 
+/// RTL testbench 自报的形状（`tb_core --print-shape`）。
+///
+/// `warpsz` 是硬件 warp 大小，`max_block_dim` 是一次启动能激活的线程数（P2 只有 1 条
+/// warp），`max_grid` 是 block 数容量。
+#[derive(Deserialize, Debug, Clone, Copy)]
+pub struct RtlShape {
+    pub warpsz: usize,
+    pub max_block_dim: usize,
+    pub max_grid: u32,
+}
+
 impl Case {
     /// 读一个 `.toml`，名字取文件名；`program` 相对它所在目录解析。
     pub fn load(path: &Path) -> Result<Case, String> {
@@ -274,20 +285,44 @@ impl Case {
         problems
     }
 
-    /// RTL 现在的形状（1 warp × 1 lane × 1 block）；跑不了就返回原因。
-    pub fn rtl_eligible(&self) -> Result<(), String> {
-        if self.spec.warpsz != 1 || self.spec.nwarp != 1 {
+    /// block 的线程数：case 里没写就用满容量（`nwarp × warpsz`）。
+    pub fn block_dim(&self) -> usize {
+        self.spec
+            .block_dim
+            .unwrap_or(self.spec.nwarp * self.spec.warpsz)
+    }
+
+    /// 这个 case 能不能送进 RTL：形状要落在核的能力里，跑不了就返回原因（SKIP）。
+    ///
+    /// `shape` 由 testbench 自报（`tb_core --print-shape`，来自 `SK_core.shape_o`），
+    /// 这样 runner 和 Makefile 里都不用再抄一份 lane 数。
+    pub fn rtl_eligible(&self, shape: &RtlShape) -> Result<(), String> {
+        if self.spec.warpsz != shape.warpsz {
             return Err(format!(
-                "需要 {} warp × {} lane，RTL 现在还只有 1 warp × 1 lane（P2）",
-                self.spec.nwarp, self.spec.warpsz
+                "warpsz = {}，RTL 是 {}（同一份 RTL 只跑一种 warp 大小）",
+                self.spec.warpsz, shape.warpsz
             ));
         }
-        if self.spec.block_dim.is_some_and(|block_dim| block_dim != 1) {
-            return Err("block_dim 不是 1，RTL 还只有一条 lane（P2）".to_string());
+        let block_dim = self.block_dim();
+        if block_dim == 0 || block_dim % shape.warpsz != 0 {
+            return Err(format!("block_dim = {block_dim} 不是 warpsz 的整数倍"));
         }
-        if self.spec.grid != 1 {
+        if block_dim > shape.max_block_dim {
             return Err(format!(
-                "需要 {} 个 block，RTL 还是单 block（P2/P3）",
+                "block_dim = {block_dim}，RTL 一次只激活 1 条 warp（最多 {} 个线程，P3 才有调度器）",
+                shape.max_block_dim
+            ));
+        }
+        if self.spec.nwarp * self.spec.warpsz != block_dim {
+            return Err(format!(
+                "block_dim = {block_dim} 只占 {} 条 warp（共 {} 条），RTL 现在还只跑满 block（P3）",
+                block_dim / shape.warpsz,
+                self.spec.nwarp
+            ));
+        }
+        if self.spec.grid > shape.max_grid {
+            return Err(format!(
+                "grid = {}，RTL 还是单 block（P3/P6）",
                 self.spec.grid
             ));
         }

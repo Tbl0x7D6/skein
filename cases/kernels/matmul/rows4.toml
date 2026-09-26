@@ -1,0 +1,33 @@
+# matmul：单 warp × 4 lane，rows = 4（每个 lane 认领一行：覆盖多 lane LDS/STS + BAR）
+program = "matmul.s"
+warpsz = 4
+nwarp = 1
+block_dim = 4
+
+[sreg]
+PTR_A = 0x1000
+PTR_B = 0x2000
+PTR_C = 0x3000
+ARG0 = 4
+
+[[init]]
+space = "gmem"
+addr = 0x1000
+gen = "matmul_a"
+args = { rows = 4 }
+
+[[init]]
+space = "gmem"
+addr = 0x2000
+gen = "matmul_b"
+
+[[check]]
+space = "gmem"
+addr = 0x3000
+words = 64
+
+[expect]
+status = "OK"
+barriers = 1
+# 每个 MAC 摊到的指令数约 3；stride 算错会多跑一倍以上
+max_steps = 8000
