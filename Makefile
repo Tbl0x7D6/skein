@@ -4,6 +4,8 @@ SRC    ?= cases/kernels/vecadd/vecadd.s
 BUILD  ?= build
 ARGS   ?=
 K      ?=
+VIVADO ?= $(firstword $(wildcard /tools/Xilinx/Vivado/*/bin/vivado) vivado)
+SYN_LANES ?= 4 8 16
 KERNEL := $(basename $(notdir $(SRC)))
 RTL_SRCS := rtl/SK_pkg.sv $(wildcard rtl/lib/*.sv rtl/core/*.sv rtl/mem/*.sv)
 RTL_TOP  ?= SK_core
@@ -13,7 +15,7 @@ CASES    ?= cases
 CASE     ?=
 WAVE     ?= $(BUILD)/$(basename $(notdir $(CASE))).fst
 
-.PHONY: help asm sim test lint rtl-lint rtl-sim tb-trace wave regress clean
+.PHONY: help asm sim test lint rtl-lint rtl-sim tb-trace wave synth regress clean
 
 help:
 	@echo "make asm [SRC=...]   汇编 kernel 到 $(BUILD)/<kernel>.bin"
@@ -24,6 +26,7 @@ help:
 	@echo "make rtl-sim         编译 Verilator 模型，跑 $(CASES)/ 的用例，与黄金模型对拍"
 	@echo "make tb-trace        编译带 FST 波形的模型：tb_core_trace --dump-wave <file.fst>"
 	@echo "make wave            跑单个 case 并存波形：make wave CASE=cases/directed/sum.toml"
+	@echo "make synth           按 lane 数扫综合/实现（SYN_LANES=\"4 8 16\"），报告在 $(BUILD)/syn/"
 	@echo "make regress         lint + test + rtl-lint + rtl-sim"
 	@echo "make clean           清理构建产物"
 
@@ -64,6 +67,14 @@ $(RTL_TB_TRACE): $(RTL_SRCS) tb/tb_core.cpp | $(BUILD)
 	    -Mdir $(BUILD)/obj_core_trace -o tb_core_trace $(RTL_SRCS) tb/tb_core.cpp
 
 tb-trace: $(RTL_TB_TRACE)
+
+# lane 数扫描：只用来决定 SK_NUM_LANES，不进 regress
+synth:
+	@for lanes in $(SYN_LANES); do \
+	    echo "--- lanes=$$lanes"; \
+	    $(VIVADO) -mode batch -nojournal -nolog -source syn/synth_core.tcl \
+	        -tclargs $$lanes $(BUILD)/syn/lanes$$lanes || exit 1; \
+	done
 
 # 手动跑一个 case 并 dump 波形：make wave CASE=cases/directed/sum.toml [WAVE=build/sum.fst]
 wave: $(RTL_TB_TRACE)

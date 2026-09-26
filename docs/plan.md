@@ -76,20 +76,31 @@ BAD_INSN / PC_OOB 两个错误码用例和单 lane 版 vecadd，状态与黄金�
 
 ## P2 — N lane SIMT
 
-**目标**：把单 lane 复制成 `SK_NUM_LANES` 个 lane，共享 PC 和 mask，加入谓词化。
+**目标**：把单 lane 复制成 `SK_NUM_LANES` 个 lane，共享 PC 和执行 mask `M`，写回、
+访存、谓词写都按 lane 门控；顺手修掉黄金模型允许写 `r0` 的分歧。
 
 **交付物**
 
-- 每 lane 一套寄存器堆（LUTRAM，3 读 1 写），加上操作数收集和写回分发。
-- `M` 门控：写回、访存、谓词写都受 `M`（和 `@p`）约束。
-- `CMP` 写谓词；`SEL` 和 `@p` 谓词化指令。
-- `SK_mask.sv` 支持 `M` 和 GPR 操作数的 mask 指令；`.P`/`.PM` 的谓词按 `p & M` 读、
-  之后是普通位运算（结果不强制 ⊆ `M`），`.PM` 同拍写 `rd` 和 `M`。
-- lane 数参数化；做 4/8 lane 的综合实验（顺带记录 16 lane 的参考数据），
-  记录 LUT、FF、Fmax，决定最终 lane 数。
-- vecadd（N lane）与黄金模型逐元素一致，进回归。
+- `SK_regfile` 加 `LANES` 维度（每 lane 3 读 1 写 + 扫描口加 lane 选择）；
+  `SK_core` 按 lane 例化 `SK_alu`，写回数据/门控都变成 per-lane；`SK_mask` 的 `M`
+  和谓词输入扩到 N 位；`SHFL` 走 N×N 交换网络，`VOTE` 是 N 位归约后广播。
+- `S_LANEID` / `S_TID = WID × WARPSZ + LANEID` 由核按 lane 算；`shape_o` 输出
+  `{NWARP, NUM_LANES}`，testbench 和 runner 都从它拿形状，不再各写一份常量。
+- 访存多周期：一条 `LDS/STS/LDG/STG` 占 `SK_NUM_LANES` 拍，按 lane 顺序每拍一条
+  （没 active lane 也照走），期间冻结取指和 E 级译码结果；出错即停在这条 lane 上，
+  出错之后的架构状态不作为保证（见 [design.md](design.md) §5.5）。
+- 黄金模型只修 `r0`：写 `r0` 被丢弃（和 RTL 的寄存器堆一致），访存语义不动。
+- 用例框架：`skein-case` 用 `tb_core --print-shape` 探形状做 SKIP 判定；golden 报错时
+  只比 `status` 和 `pc`，不再刷一屏无意义的 GPR 差异。8 个单 lane 用例改成单 warp ×
+  4 lane，新增 `kernels/matmul/rows4`（多 lane `LDS/STS` + `BAR`）。
+- lane 数扫描：`syn/synth_core.tcl` + `make synth`，在 xcu250 上按 4/8/16 lane 各综合
+  一遍，记录 LUT/FF/DSP/URAM 和 200 MHz 下的 WNS（数据见 design.md §12.6）。
 
-**验收**：N lane vecadd 在 Verilator 里跑通；综合实验数据记录在案。
+**验收**：`make regress` 全绿；`make rtl-sim` 是 10 PASS / 4 SKIP / 0 FAIL，SKIP 只剩
+需要多 warp 的 `vecadd/warp4` 和 `matmul/{rows16,rows23,bdim8}`；综合数据记录在案。
+
+**状态**：已完成。`SK_NUM_LANES` 冻结在 4（依据见 design.md §12.6）；RTL 仍然只跑
+1 条 warp，多 warp 和 5 级流水在 P3。
 
 ## P3 — 多 warp 调度 + scoreboard
 
@@ -200,6 +211,10 @@ mask 指令计数和理论值一致（汇编器的开销可见、可统计）；
 
 任何 RTL 改动都必须在"RTL 仿真 vs 黄金模型"这一层验证过，才允许进入综合或上板。
 
+面积/时序扫描用 `make synth`（`syn/synth_core.tcl`）：在 xcu250 上按 `SYN_LANES`
+（默认 `4 8 16`）各综合一遍（`opt_design` 为止，只有综合后的 WNS 估计），
+LUT/FF/DSP/URAM 和 WNS 落在 `build/syn/lanes*/`。它是手动目标，不进 `regress`。
+
 ### case（双仿真器对拍）
 
 `cases/` 下的 `*.toml` 是唯一的用例输入描述：黄金模型和 RTL testbench 吃同一份，
@@ -209,16 +224,16 @@ case 文件本身解析。
 
 ```
 cases/
-  directed/          单条指令或小序列的定向用例（单 lane，RTL 全跑）
-  errors/            错误码：保留编码、取指越界
+  directed/          单条指令或小序列的定向用例（单 warp × 4 lane，RTL 全跑）
+  errors/            错误码：保留编码、非对齐、取指越界（只比 status/pc）
   kernels/<kernel>/  真 kernel 的用例，按 kernel 分目录（vecadd / matmul）
 ```
 
 ```toml
 program = "sum.s"           # 或 words = [0x3b, 0x3a]（汇编器编不出的编码）
-warpsz = 1                  # 默认 4（warpSize；RTL 现在只支持 1）
-nwarp = 1                   # 默认 4
-block_dim = 1               # 可选，默认用满容量
+warpsz = 4                  # 默认 4 = SK_NUM_LANES（RTL 的硬件 warp 大小）
+nwarp = 1                   # 默认 4（硬件容量；RTL 现在一次只激活 1 条 warp）
+block_dim = 4               # 可选，默认用满容量（nwarp × warpsz）
 grid = 1
 max_steps = 100000          # 可选，黄金模型的步数上限
 
@@ -243,9 +258,15 @@ barriers = 1
 max_steps = 20480
 ```
 
+- 形状：`skein-case` 先用 `tb_core --print-shape` 问一次核的容量（来自
+  `SK_core.shape_o`），`warpsz` 对不上、`block_dim` 超过一次能激活的线程数、或者
+  `grid > 1` 的 case 报 SKIP 并注明原因；runner 和 Makefile 里都不写死 lane 数。
 - `make rtl-sim`：每个 case 先跑黄金模型、再跑 RTL，逐项比 status / pc / `M` / GPR /
-  谓词 / `[[check]]` 窗口；形状超过 1 warp × 1 lane（RTL 还没做到）的 case 报 SKIP
-  并注明原因，最后打印 PASS/SKIP/FAIL 计数。
+  谓词 / `[[check]]` 窗口。
+- 黄金模型报错（`status != OK`）时只比 status 和 pc：出错之后哪些 lane 已经提交、
+  内存写进去多少属于实现行为，不是架构契约（[design.md](design.md) §5.5），
+  逐字节比只会得到假 FAIL。报告里会标出"只比 status/pc"。
+- 最后打印 PASS/SKIP/FAIL 计数和每个 case 的 RTL 周期数。
 - `make test` 里的 `tests/cases.rs` 不依赖 Verilator：每个 case 都跑一遍黄金模型并检查
   `[expect]`，保证 case 本身是有效的测试。
 - 调试单个 case：`cargo run --bin skein-run -- --case cases/directed/sum.toml --trace`；

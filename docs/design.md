@@ -8,8 +8,8 @@
 | 项 | v0.1 目标 | 说明 |
 |---|---|---|
 | 功能 | 跑通 vecadd / reduction / sgemm 三类 kernel | 覆盖访存型与计算型 |
-| 规模 | 1 核，4 warp × 4–8 lane | lane 数由综合实验定 |
-| 频率 | 综合后 ≥ 200 MHz（U250，-2L） | 能收敛比频率重要 |
+| 规模 | 1 核，4 warp × 4 lane | warp 宽度 P2 定，见 §12.6 |
+| 频率 | 综合后 ≥ 200 MHz（U250，-2L） | 能收敛比频率重要；P2 的 2 级核还没到，见 §12.6 |
 | 面积 | ≤ 30K LUT（不含 BRAM） | 留出后续加 cache 的余量 |
 | 上板 | U250 上以 Vitis RTL kernel 形式运行 | P6 阶段 |
 
@@ -19,7 +19,7 @@ RTL 宏集中在 [SK_config.vh](../rtl/SK_config.vh)：
 
 ```systemverilog
 `define SK_XLEN        32      // 数据宽度
-`define SK_NUM_LANES    4      // warpSize；每个 warp 的 lane 数（4/8，综合实验定）
+`define SK_NUM_LANES    4      // warpSize；每个 warp 的 lane 数（P2 综合实验定，见 §12.6）
 `define SK_NUM_WARPS    4      // 每核 warp 数
 `define SK_NUM_GPR      32     // 每 lane 通用寄存器数（r0 恒为 0）
 `define SK_NUM_PRED     8      // 每 lane 谓词数
@@ -27,6 +27,9 @@ RTL 宏集中在 [SK_config.vh](../rtl/SK_config.vh)：
 `define SK_IMEM_KB      16     // 指令存储容量
 `define SK_MEM_ADDR_W   32     // global 地址宽度
 ```
+
+每个宏外面套了 `ifndef` 守卫，所以综合/仿真可以用 `-verilog_define SK_NUM_LANES=8`
+（Verilator 是 `-DSK_NUM_LANES=8`）覆盖默认值，RTL 只有一份。
 
 执行 mask `M` 是硬件寄存器（N 位），通过 `MSAVE/MREST` 与通用寄存器交换；`M` 的
 写入者还有 `MCLR.P` 和 `.PM` 形式（见 §5.4）。保存的 mask 值放在 GPR 里，由 kernel
@@ -63,9 +66,9 @@ RTL 宏集中在 [SK_config.vh](../rtl/SK_config.vh)：
                  └─────────────────────────────────────────────────────────┘
 ```
 
-P1 落地的只是其中一部分：`SK_imem`、`SK_decode`、`SK_regfile`、`SK_alu`、`SK_mask`、
-`SK_lsu`，加一个 2 级的 `SK_core`（见 §7）。图里其余模块（调度器、scoreboard、
-coalescer、AXI、上板壳）随 P2–P6 加，清单见 [plan.md](plan.md)。
+P2 落地的只是其中一部分：`SK_imem`、`SK_decode`、`SK_regfile`、`SK_alu`、`SK_mask`、
+`SK_lsu`，加一个 2 级的 `SK_core`（1 条 warp × N lane，见 §7）。图里其余模块（调度器、
+scoreboard、coalescer、AXI、上板壳）随 P3–P6 加，清单见 [plan.md](plan.md)。
 
 ## 4. 执行模型
 
@@ -89,11 +92,13 @@ coalescer、AXI、上板壳）随 P2–P6 加，清单见 [plan.md](plan.md)。
   `BLOCK_DIM`（主机写的 `blockDim.x`）决定 block 有多少线程：`1 ≤ BLOCK_DIM ≤
   NWARP × WARPSZ` 且必须是 `WARPSZ` 的整数倍（不允许部分 warp），非法值在 start 时报
   `BAD_LAUNCH`。block 数由主机的 `GRID_DIM` 决定，`S_BID` 是当前 block 索引（只读），
-  对齐 `blockIdx`；shared/global 在 block 之间不清零。
+  对齐 `blockIdx`；shared/global 在 block 之间不清零。P2 的 RTL 只实现"1 条 warp、
+  1 个 block"，多 warp 调度和 `grid > 1` 在 P3。
 - **warp 的生成与结束**：硬件有 `NWARP` 条 warp、每条 `WARPSZ` 个 lane；一次启动只激活
   前 `BLOCK_DIM / WARPSZ` 条（每条都是满 warp），其余直接 done。每条 warp 从入口
   `0x0000` 开始执行；`EXIT` 是 warp 级指令，执行到就结束整条 warp；所有活跃 warp
-  结束后硬件置 done。
+  结束后硬件置 done。`WARPSZ` 是硬件常量，`LANEID` 是 lane 在 warp 内的序号，
+  `TID = WID × WARPSZ + LANEID`——这三个由核按 lane 算，不是主机写的参数。
 - **汇编器的职责**：只做翻译——一行一条指令，认标签，编码成 32 位字。掩码序列
   （`MSAVE`/`MREST`/`MAND.P`/`MCLR.P`）是普通指令，由 kernel 手写；写法模板见 §6，
   完整例子见 [cases/kernels/vecadd/vecadd.s](../cases/kernels/vecadd/vecadd.s)。
@@ -280,6 +285,12 @@ warp 协作（R 格式；`SHFL` 是 per-lane 写回，`VOTE` 是 warp 级写回�
 
 shared 和 global 不统一编址：指令本身决定访问哪个空间。访存必须自然对齐；
 非对齐、越界和访问错误码都写进 `STATUS`，然后报错并结束 kernel。
+
+多 lane 访存在硬件里按 lane 号从小到大逐条走（P2 是每拍一条 lane）。出错的指令
+停在第一条出错的 lane 上：它之前已经提交的 lane 不回滚，它之后的 lane 不再访问。
+**出错之后的架构状态不是契约**——错误路径只保证 `STATUS` 和停下来的 PC（取指越界时
+停在取不到的地址），`r0`/GPR/谓词/`M`/内存里剩下什么是实现行为；黄金模型这边是
+整条指令零副作用，RTL 这边是"遇错即停"，两者不要求逐字节一致。
 
 `STATUS` 取值（P0 冻结，非 0 表示 kernel 已经报错结束）：
 
@@ -484,9 +495,16 @@ v0.1 采用 5 级流水线；lane 数取 8 时可以在 S3/S4 之间加一级操
 发射，其他 warp 继续。每个 warp 一个 scoreboard（4–8 个 slot）跟踪 `LDG` 的目标
 寄存器；`STG` 是 posted write，用 outstanding 计数在内核结束前排空。
 
-P1 先做 2 级：BRAM 取指一拍，加一个执行级，执行级同拍写回（寄存器堆是"写在下一条
+P1/P2 先做 2 级：BRAM 取指一拍，加一个执行级，执行级同拍写回（寄存器堆是"写在下一条
 指令读之前"，不用前递）；统一分支也在这一级解析，命中就把在途的取指丢掉，代价是一个
 空泡。拆成 5 级和 P3 的调度器、scoreboard 一起做。
+
+P2 的核是 1 条 warp × `SK_NUM_LANES` 个 lane：每 lane 一套寄存器和谓词，`SK_alu`
+按 lane 例化，写回、访存和谓词写按 `M & @p` 逐 lane 门控；`VOTE` 的结果广播给所有
+lane，`SHFL` 是 N×N 交换网络。访存是多周期的——一条 `LDS/STS/LDG/STG` 占
+`SK_NUM_LANES` 拍，按 lane 顺序每拍一条，期间冻结取指和执行级（译码结果存在
+`ctrl_e_q` 里），没有 active lane 也照走；这一步慢，P5 的合并器就是冲它去的。
+2 级流水在 200 MHz 下收不收敛（见 §12.6），拆流水线是 P3 的第一件事。
 
 ## 8. 存储层次
 
@@ -500,6 +518,8 @@ P1 先做 2 级：BRAM 取指一拍，加一个执行级，执行级同拍写回
 
 访存合并是性能的第一来源（P5 做）：同一 warp 内多条 active lane 的地址落在同一
 cache line 时合并成一次总线事务。v0.1 的 kernel 先用小工作集，性能差是预期行为。
+P2 的访存每拍只服务一条 lane、也不跳过 inactive lane（组合逻辑换面积和时间），
+所以一个访存核的 IPC 上限是 `1 / SK_NUM_LANES`；合并、bank 化和跳过空 lane 都在 P5。
 
 ## 9. 主机接口（P6）
 
@@ -530,7 +550,8 @@ GPU 顶层做成标准 Vitis RTL kernel：
 - 是否需要 mask 零/非零之外的统一分支条件（v0.1 先不做，需要时再加指令）。
 - `SHFL.IDX` 的取模：v0.1 的 `WARPSZ` 是 4/8（2 的幂），硬件用低位掩码就够；将来
   `WARPSZ` 不是 2 的幂时要真取模（比较链或除法器）。
-- `SK_NUM_LANES` 取 4 还是 8（综合实验定）。
+- warp 宽度冻结在 4 lane（§12.6）：P3 拆完流水线、P5 有合并器之后再用真实 Fmax 和
+  带宽数据复议要不要上 8 lane。
 - IMEM 16 KB、shared 32 KB 是否够用；shared bank 数取 lane 数还是 2×lane 数。
 - scoreboard 需要多少个 outstanding slot。
 - sgemm 是否需要 `MUL` 之外的整数除法，还是用移位/循环代替。
@@ -587,10 +608,28 @@ shared memory（`LDS/STS`，16 位地址，片上 BRAM 多 bank）和 global mem
 LUTRAM/FF 阵列更匹配，也更容易随 lane 数扩展。BRAM 留给 shared memory、IMEM
 和以后的 cache。
 
-### 12.6 起始配置 1 核 4 warp × 4–8 lane
+### 12.6 起始配置 1 核 4 warp × 4 lane
 
-warp 宽度直接决定寄存器堆、操作数网络、ALU 和 shared bank 的规模；先用 4 lane
-跑通，再用综合实验决定是否上 8 lane。面积预算 30K LUT，先用实际数据说话。
+warp 宽度直接决定寄存器堆、操作数网络、ALU、`SHFL` 交换网络和 shared bank 的规模。
+P2 把核按 4/8/16 lane 各综合了一遍（`make synth`：xcu250、200 MHz 约束、到
+`opt_design` 为止，只统计核本身）。
+
+| lane | LUT | FF | URAM | DSP | WNS @200 MHz |
+|---|---|---|---|---|---|
+| 4 | 10104 | 4172 | 1 | 15 | −2.50 ns |
+| 8 | 17675 | 8175 | 1 | 27 | −2.34 ns |
+| 16 | 35831 | 16184 | 1 | 51 | −2.77 ns |
+
+（URAM 是 16 KB IMEM；寄存器堆推断成 FF + mux，没有落成 BRAM。WNS 是综合后估计，
+布局布线只会更差。）
+
+取 **4 lane**：三个配置都还没收敛到 200 MHz，瓶颈在 2 级流水本身（见 §7），这时候
+用 Fmax 挑 lane 数没有意义；面积上 8 lane 已经 17.7K LUT、16 lane 35.8K，超过 §1 的
+30K 预算；而且 P2 的访存每拍只服务一条 lane，lane 越多单条访存指令越慢，在 P5 有
+合并器之前加 lane 对访存型 kernel 没有收益。
+
+复议的时机：P3 拆完流水线（有可信的 Fmax）之后，用真实 IPC 和带宽数据再看要不要上
+8 lane；那之前 `SK_NUM_LANES` 保持 4。
 
 ### 12.7 内存层次分步走
 

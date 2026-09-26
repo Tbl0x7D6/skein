@@ -5,8 +5,8 @@ Skein 是一个从零手写的小型 SIMT 处理器（GPGPU），目标是把 FP
 
 指令集是自己设计的 32 位定长 ISA，不依赖现成编译器；kernel 用手写汇编，配一个
 汇编器和一个黄金模型。ISA 编码已经冻结（[design.md](docs/design.md) §5）；汇编器、
-黄金模型和测试在 `tools/`（Rust），单 lane 的核在 `rtl/`（P1 已完成），两者用同一份
-程序逐寄存器对拍。
+黄金模型和测试在 `tools/`（Rust），核在 `rtl/`（P2 完成：1 条 warp × 4 lane），
+两者用同一份程序逐寄存器对拍。
 
 ## 快速上手
 
@@ -18,6 +18,7 @@ make sim SRC=cases/kernels/vecadd/vecadd.s ARGS="--help"         # 两个工具�
 make rtl-sim                                                    # 把 cases/ 逐个送进 RTL 和黄金模型对拍
 make tb-trace                                                   # 编译带 FST 波形的模型（手动跑 tb_core_trace）
 make wave CASE=cases/directed/sum.toml                          # 跑单个 case，波形 dump 到 build/sum.fst
+make synth                                                       # 按 lane 数扫综合/实现（Vivado，几分钟起步）
 make regress                                                    # 上面全跑一遍：fmt + clippy + test + lint + 仿真
 ```
 
@@ -54,8 +55,10 @@ tools/     Rust 工具链（一个 cargo crate）：src/isa.rs 编码定义、sr
 cases/     用例：程序 + launch 形状 + 初态 + 比对窗口，golden 和 RTL 共用（*.toml）；
            directed/ 定向、errors/ 错误码、kernels/<kernel>/ 按 kernel 分目录
            （kernel 汇编源码和它的用例放一起）
-tb/        Verilator testbench（tb_core.cpp）：喂输入、跑、dump 状态
-syn/u250/  v++ 打包脚本与链接配置
+tb/        Verilator testbench（tb_core.cpp）：喂输入、跑、dump 状态；--print-shape
+           报核的形状，skein-case 用它决定哪些 case 能跑
+syn/       综合脚本：synth_core.tcl 按 lane 数扫面积/时序；u250/ 是 P6 的 v++ 打包
+           脚本与链接配置
 sw/        主机程序：runtime/ XRT 驱动、tests/ 上板用例
 ```
 

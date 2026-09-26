@@ -6,6 +6,7 @@ obj_dir/
 *.xclbin
 *.jou
 *.log
+.Xil/
 
 # Python
 __pycache__/

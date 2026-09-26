@@ -14,7 +14,7 @@
 //! `pred` 字段 0 = 无谓词，1..8 = `@p0..@p7`。mask 指令的 `.P` 形式把谓词号放在
 //! `rb` 字段（0..7）。`pinv` 为 1 表示 `@!p`（只有 R/SR 格式有这一位）。
 
-pub const NUM_LANES: usize = 4; // 与 rtl/SK_config.vh 保持一致
+pub const NUM_LANES: usize = 4; // 与 rtl/SK_config.vh 保持一致（P2 冻结，design.md §12.6）
 pub const NUM_WARPS: usize = 4;
 pub const NUM_GPR: usize = 32;
 pub const NUM_PRED: usize = 8;
