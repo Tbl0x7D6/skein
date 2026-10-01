@@ -1,8 +1,8 @@
 //! skein-case：把 `cases/*.toml` 同时送进黄金模型和 RTL testbench，逐项比对。
 //!
 //! 黄金模型在进程里跑；RTL 由 Verilator 的 `tb_core` 跑，它只负责喂输入、dump 状态，
-//! 比对逻辑都在这里。形状不支持的 case（多 warp / 多 block）只跑黄金模型，报 SKIP；
-//! 形状由 `tb_core --print-shape` 自报，所以这里不写死 lane 数。
+//! 比对逻辑都在这里。形状不支持的 case（block 比核还大、多 block）只跑黄金模型，报
+//! SKIP；形状由 `tb_core --print-shape` 自报，所以这里不写死 lane 数 / warp 数。
 //!
 //! 黄金模型报错（status != OK）时只比 status 和 pc：出错之后哪些 lane / 哪些存储已经
 //! 生效属于实现行为，不是架构契约（见 docs/design.md §5.5），逐字节比只会得到假 FAIL。
@@ -45,6 +45,10 @@ struct Args {
     /// 而且要配带波形的模型（--rtl-tb 指向 make tb-trace 出来的 tb_core_trace）
     #[arg(long, value_name = "FILE")]
     wave: Option<PathBuf>,
+
+    /// 每个 case 多打一行性能计数器（IPC 的分解，M3 的曲线从这儿拿数据）
+    #[arg(long)]
+    stats: bool,
 }
 
 /// `tb_core --dump-state` 写出来的状态快照。
@@ -53,9 +57,46 @@ struct Snapshot {
     status: u32,
     #[serde(default)]
     cycles: u64,
+    #[serde(default)]
+    perf: Perf,
     warps: Vec<SnapshotWarp>,
     #[serde(default)]
     mem: Vec<SnapshotWindow>,
+}
+
+/// RTL 的性能计数器（`SK_perf`，见 docs/design.md §13）。
+#[derive(Deserialize, Debug, Default)]
+struct Perf {
+    #[serde(default)]
+    cycles: u64,
+    #[serde(default)]
+    issued: u64,
+    #[serde(default)]
+    retired: u64,
+    #[serde(default)]
+    replay: u64,
+    #[serde(default)]
+    barriers: u64,
+    #[serde(default)]
+    stall_no_warp: u64,
+    #[serde(default)]
+    lsu_busy: u64,
+}
+
+impl Perf {
+    /// IPC = 提交的指令数 / 周期数；一次都没跑就报 0。
+    fn ipc(&self) -> f64 {
+        if self.cycles == 0 {
+            0.0
+        } else {
+            self.retired as f64 / self.cycles as f64
+        }
+    }
+
+    /// 没发射的拍数：`CYCLE - INST_ISSUED`（读的时候算，RTL 里不占计数器）。
+    fn no_issue(&self) -> u64 {
+        self.cycles.saturating_sub(self.issued)
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -76,6 +117,8 @@ struct SnapshotWindow {
 enum Outcome {
     Pass {
         cycles: u64,
+        ipc: f64,
+        stats: Option<String>,
         wave: Option<PathBuf>,
         limited: bool,
     },
@@ -98,8 +141,8 @@ fn main() -> ExitCode {
             match probe_shape(tb) {
                 Ok(shape) => {
                     println!(
-                        "RTL 形状：{} lane/warp，最多 {} 个线程/block，{} 个 block",
-                        shape.warpsz, shape.max_block_dim, shape.max_grid
+                        "RTL 形状：{} lane/warp × {} warp，最多 {} 个线程/block，{} 个 block",
+                        shape.warpsz, shape.nwarp, shape.max_block_dim, shape.max_grid
                     );
                     Some(shape)
                 }
@@ -141,18 +184,26 @@ fn main() -> ExitCode {
         match run(case, &args, shape.as_ref()) {
             Ok(Outcome::Pass {
                 cycles,
+                ipc,
+                stats,
                 wave,
                 limited,
             }) => {
                 passed += 1;
                 let note = if limited { "  只比 status/pc" } else { "" };
+                let stats = stats
+                    .map(|line| format!("\n    {line}"))
+                    .unwrap_or_default();
                 match wave {
                     Some(path) => println!(
-                        "{:<width$} PASS  cycles={cycles}  wave={}{note}",
+                        "{:<width$} PASS  cycles={cycles}  IPC={ipc:.3}  wave={}{note}{stats}",
                         case.name,
                         path.display()
                     ),
-                    None => println!("{:<width$} PASS  cycles={cycles}{note}", case.name),
+                    None => println!(
+                        "{:<width$} PASS  cycles={cycles}  IPC={ipc:.3}{note}{stats}",
+                        case.name
+                    ),
                 }
             }
             Ok(Outcome::Skip { reason }) => {
@@ -268,11 +319,39 @@ fn run(case: &Case, args: &Args, shape: Option<&RtlShape>) -> Result<Outcome, Ve
     })?;
     let windows = case.read_windows(&machine).map_err(|err| vec![err])?;
 
-    let problems = compare(&machine, &windows, &snapshot);
+    let mut problems = compare(&machine, &windows, &snapshot);
     let limited = machine.status != Status::Ok;
+    // 提交条数和 BAR 次数要和黄金模型对得上（报错用例的路径本来就不一样，不比）
+    if !limited {
+        if snapshot.perf.retired != machine.steps {
+            problems.push(format!(
+                "RTL 提交 {} 条指令，黄金模型执行了 {} 条",
+                snapshot.perf.retired, machine.steps
+            ));
+        }
+        if snapshot.perf.barriers != machine.barriers {
+            problems.push(format!(
+                "RTL 放行 {} 次 BAR，黄金模型 {} 次",
+                snapshot.perf.barriers, machine.barriers
+            ));
+        }
+    }
     if problems.is_empty() {
+        let stats = args.stats.then(|| {
+            format!(
+                "issued={} retired={} replay={} no_issue={} no_warp={} lsu_busy={}",
+                snapshot.perf.issued,
+                snapshot.perf.retired,
+                snapshot.perf.replay,
+                snapshot.perf.no_issue(),
+                snapshot.perf.stall_no_warp,
+                snapshot.perf.lsu_busy,
+            )
+        });
         Ok(Outcome::Pass {
             cycles: snapshot.cycles,
+            ipc: snapshot.perf.ipc(),
+            stats,
             wave: args.wave.clone(),
             limited,
         })
@@ -281,7 +360,7 @@ fn run(case: &Case, args: &Args, shape: Option<&RtlShape>) -> Result<Outcome, Ve
     }
 }
 
-/// RTL 的快照 vs 黄金模型：状态、warp 0 的 pc/M/GPR/谓词，加上 case 声明的内存窗口。
+/// RTL 的快照 vs 黄金模型：状态、每条 warp 的 pc/M/GPR/谓词，加上 case 声明的内存窗口。
 ///
 /// 黄金模型报错时只比 status 和 pc——出错之后哪些 lane 已经提交、内存写进去多少都属于
 /// 实现行为（docs/design.md §5.5），不是架构契约；比下去只会得到假 FAIL。
@@ -301,49 +380,84 @@ fn compare(golden: &Machine, windows: &[Vec<u32>], rtl: &Snapshot) -> Vec<String
         ));
     }
 
-    let Some(warp) = rtl.warps.first() else {
-        problems.push("RTL 的 dump 里没有 warp".to_string());
+    if rtl.warps.len() < golden.warps.len() {
+        problems.push(format!(
+            "RTL 的 dump 里只有 {} 条 warp，黄金模型有 {} 条",
+            rtl.warps.len(),
+            golden.warps.len()
+        ));
         return problems;
-    };
-    let want_warp = &golden.warps[0];
-    if warp.pc as usize != want_warp.pc {
-        problems.push(format!("pc 期望 {}，实际 {}", want_warp.pc, warp.pc));
+    }
+    // 每条 warp 各比各的：pc 出错时是"停在哪儿"的信息，report 里留着
+    for (wid, want_warp) in golden.warps.iter().enumerate() {
+        let warp = &rtl.warps[wid];
+        if warp.pc as usize != want_warp.pc {
+            problems.push(format!("w{wid} pc 期望 {}，实际 {}", want_warp.pc, warp.pc));
+        }
     }
     if golden.status != Status::Ok {
         return problems;
     }
-    if warp.m != want_warp.m {
-        problems.push(format!("M 期望 {:#x}，实际 {:#x}", want_warp.m, warp.m));
-    }
-    for (lane, want_gpr) in want_warp.gpr.iter().enumerate() {
-        let Some(rtl_gpr) = warp.gpr.get(lane) else {
-            problems.push(format!("RTL 的 dump 少了 lane {lane}"));
-            continue;
-        };
-        for (reg, want) in want_gpr.iter().enumerate() {
-            match rtl_gpr.get(reg) {
-                Some(actual) if actual == want => {}
-                Some(actual) => problems.push(format!(
-                    "lane {lane} r{reg} 期望 {want}（{want:#x}），实际 {actual}（{actual:#x}）"
-                )),
-                None => problems.push(format!("lane {lane} 少了 r{reg}")),
+    for (wid, want_warp) in golden.warps.iter().enumerate() {
+        let warp = &rtl.warps[wid];
+        if warp.m != want_warp.m {
+            problems.push(format!(
+                "w{wid} M 期望 {:#x}，实际 {:#x}",
+                want_warp.m, warp.m
+            ));
+        }
+        for (lane, want_gpr) in want_warp.gpr.iter().enumerate() {
+            let Some(rtl_gpr) = warp.gpr.get(lane) else {
+                problems.push(format!("w{wid} 的 dump 少了 lane {lane}"));
+                continue;
+            };
+            for (reg, want) in want_gpr.iter().enumerate() {
+                match rtl_gpr.get(reg) {
+                    Some(actual) if actual == want => {}
+                    Some(actual) => problems.push(format!(
+                        "w{wid} lane {lane} r{reg} 期望 {want}（{want:#x}），实际 {actual}（{actual:#x}）"
+                    )),
+                    None => problems.push(format!("w{wid} lane {lane} 少了 r{reg}")),
+                }
+            }
+        }
+        for (lane, want_pred) in want_warp.pred.iter().enumerate() {
+            let Some(rtl_pred) = warp.pred.get(lane) else {
+                problems.push(format!("w{wid} 的 dump 少了 lane {lane} 的谓词"));
+                continue;
+            };
+            for (index, want) in want_pred.iter().enumerate() {
+                let actual = rtl_pred.get(index).copied().unwrap_or(0) != 0;
+                if actual != *want {
+                    problems.push(format!(
+                        "w{wid} lane {lane} p{index} 期望 {}，实际 {}",
+                        u8::from(*want),
+                        u8::from(actual)
+                    ));
+                }
             }
         }
     }
-    for (lane, want_pred) in want_warp.pred.iter().enumerate() {
-        let Some(rtl_pred) = warp.pred.get(lane) else {
-            problems.push(format!("RTL 的 dump 少了 lane {lane} 的谓词"));
-            continue;
-        };
-        for (index, want) in want_pred.iter().enumerate() {
-            let actual = rtl_pred.get(index).copied().unwrap_or(0) != 0;
-            if actual != *want {
-                problems.push(format!(
-                    "lane {lane} p{index} 期望 {}，实际 {}",
-                    u8::from(*want),
-                    u8::from(actual)
-                ));
-            }
+    // 核的容量比 case 用的大时，多出来的 warp 必须是"没跑过"的样子（PC = 0、
+    // M = 完整 mask、GPR 和谓词全 0）；真跑过就说明调度器把不该起来的 warp 放出去了。
+    let full = if golden.warpsz >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << golden.warpsz) - 1
+    };
+    for (wid, warp) in rtl.warps.iter().enumerate().skip(golden.warps.len()) {
+        let pristine = warp.pc == 0
+            && warp.m == full
+            && warp.gpr.iter().all(|lane| lane.iter().all(|reg| *reg == 0))
+            && warp
+                .pred
+                .iter()
+                .all(|lane| lane.iter().all(|bit| *bit == 0));
+        if !pristine {
+            problems.push(format!(
+                "w{wid} 不在这个 block 里，但状态不是没跑过的样子（pc={} m={:#x}）",
+                warp.pc, warp.m
+            ));
         }
     }
 

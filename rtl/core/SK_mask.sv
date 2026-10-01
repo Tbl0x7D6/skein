@@ -1,4 +1,5 @@
-//! mask 单元：M 寄存器和 mask 指令的位运算，宽度 = lane 数。
+//! mask 单元：mask 指令的位运算。纯组合——`M` 本身每个 warp 一份，存在 `SK_core`
+//! 里（`m_q`），提交级才写回去，这样多 warp 共用一个组合逻辑。
 //!
 //! mask 指令是 warp 级操作，不受 M 门控、结果写所有 lane。`.P`/`.PM` 把谓词按
 //! `p & M` 读，之后做普通位运算（结果不强制 ⊆ M）；`.PM` 同一拍写 `rd` 和 `M`，
@@ -10,40 +11,35 @@
 module SK_mask #(
     parameter int LANES = 4
 ) (
-    input  logic                clk,
-    input  logic                aresetn,
-    input  logic                init_i,      // 块开始：M = full
-    input  logic [LANES-1:0]    full_i,      // warp 生成时的完整 mask
-    input  logic                en_i,        // 本拍执行的是 mask 指令
+    input  logic                [LANES-1:0] full_i,     // warp 生成时的完整 mask
+    input  logic                [LANES-1:0] m_i,        // 当前执行 mask（旧值）
     input  SK_pkg::sk_mask_e    op_i,
-    input  logic [31:0]         ra_i,        // lane 0 的 GPR 操作数（warp 一致）
-    input  logic [31:0]         rb_i,        // 同上，MAND/MANDN/MOR 的第二个操作数
-    input  logic [LANES-1:0]    p_i,         // 谓词字（`.P`/`.PM`/`MCLR.P`）
-    output logic [LANES-1:0]    m_o,         // 当前执行 mask M
-    output logic [31:0]         rd_o,
-    output logic                rd_we_o
+    input  logic                [31:0]      ra_i,       // lane 0 的 GPR 操作数（warp 一致）
+    input  logic                [31:0]      rb_i,       // 同上，MAND/MANDN/MOR 的第二个操作数
+    input  logic                [LANES-1:0] p_i,        // 谓词字（`.P`/`.PM`/`MCLR.P`）
+    output logic                [31:0]      value_o,    // 写 rd 的值
+    output logic                            rd_we_o,
+    output logic                [LANES-1:0] m_o,        // 写 M 的值（m_we_o 为 1 时有效）
+    output logic                            m_we_o
 );
 
     import SK_pkg::*;
 
-    logic [LANES-1:0] m_q, m_d;
-    logic             m_wr;
-    logic [31:0]      value;
-    logic             rd_wr;
-    logic [31:0]      pred;      // p_i 零扩展
-    logic [31:0]      mask;      // M 零扩展
+    logic [31:0] pred;      // p_i 零扩展
+    logic [31:0] mask;      // M 零扩展
+    logic [31:0] value;
 
     always_comb begin
-        pred  = 32'(p_i);
-        mask  = 32'(m_q);
-        value = 32'd0;
-        m_d   = m_q;
-        m_wr  = 1'b0;
-        rd_wr = 1'b1;
+        pred   = 32'(p_i);
+        mask   = 32'(m_i);
+        value  = 32'd0;
+        m_o    = m_i;
+        m_we_o = 1'b0;
+        rd_we_o = 1'b1;
 
         unique case (op_i)
-            SK_MASK_SAVE:   value = mask;                                // M -> rd
-            SK_MASK_REST:   begin value = ra_i; m_wr = 1'b1; rd_wr = 1'b0; end
+            SK_MASK_SAVE:   value = mask;                                 // M -> rd
+            SK_MASK_REST:   begin value = ra_i; m_o = ra_i[LANES-1:0]; m_we_o = 1'b1; rd_we_o = 1'b0; end
             SK_MASK_MOV:    value = ra_i;
             SK_MASK_NOT:    value = ~ra_i;
             SK_MASK_AND:    value = ra_i & rb_i;
@@ -52,38 +48,21 @@ module SK_mask #(
             SK_MASK_AND_P:  value = ra_i & (pred & mask);
             SK_MASK_ANDN_P: value = ra_i & ~(pred & mask);
             SK_MASK_OR_P:   value = ra_i | (pred & mask);
-            SK_MASK_CLR_P:  begin value = mask; m_wr = 1'b1; rd_wr = 1'b0; end
-            SK_MASK_AND_PM: begin value = ra_i & (pred & mask); m_wr = 1'b1; end
-            SK_MASK_ANDN_PM: begin value = ra_i & ~(pred & mask); m_wr = 1'b1; end
-            SK_MASK_OR_PM:  begin value = ra_i | (pred & mask); m_wr = 1'b1; end
-            default:        rd_wr = 1'b0;
+            SK_MASK_CLR_P:  begin value = mask; m_o = m_i & ~p_i; m_we_o = 1'b1; rd_we_o = 1'b0; end
+            SK_MASK_AND_PM: begin value = ra_i & (pred & mask); m_we_o = 1'b1; end
+            SK_MASK_ANDN_PM: begin value = ra_i & ~(pred & mask); m_we_o = 1'b1; end
+            SK_MASK_OR_PM:  begin value = ra_i | (pred & mask); m_we_o = 1'b1; end
+            default:        rd_we_o = 1'b0;
         endcase
 
-        // rd 一律被完整 mask 夹住
+        // rd 一律被完整 mask 夹住；写 M 的值用刚算出来的 rd（`.PM`），最后也夹一次
         value = value & 32'(full_i);
-        // 写 M 的值：MREST 用 ra、MCLR.P 用 M & ~p、`.PM` 用刚算出来的 rd
-        if (m_wr) begin
-            unique case (op_i)
-                SK_MASK_REST:  m_d = ra_i[LANES-1:0];
-                SK_MASK_CLR_P: m_d = m_q & ~p_i;
-                default:       m_d = value[LANES-1:0];
-            endcase
+        if (m_we_o && (op_i != SK_MASK_REST) && (op_i != SK_MASK_CLR_P)) begin
+            m_o = value[LANES-1:0];
         end
-        m_d = m_d & full_i;
+        m_o = m_o & full_i;
     end
 
-    always_ff @(posedge clk) begin
-        if (!aresetn) begin
-            m_q <= full_i;
-        end else if (init_i) begin
-            m_q <= full_i;
-        end else if (en_i && m_wr) begin
-            m_q <= m_d;
-        end
-    end
-
-    assign m_o     = m_q;
-    assign rd_o    = value;
-    assign rd_we_o = en_i && rd_wr;
+    assign value_o = value;
 
 endmodule

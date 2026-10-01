@@ -101,11 +101,12 @@ pub struct Case {
 
 /// RTL testbench 自报的形状（`tb_core --print-shape`）。
 ///
-/// `warpsz` 是硬件 warp 大小，`max_block_dim` 是一次启动能激活的线程数（P2 只有 1 条
-/// warp），`max_grid` 是 block 数容量。
+/// `warpsz` / `nwarp` 是硬件容量（每个 warp 的 lane 数、每条 block 的 warp 数），
+/// `max_block_dim` 是一次启动能激活的线程数，`max_grid` 是 block 数容量。
 #[derive(Deserialize, Debug, Clone, Copy)]
 pub struct RtlShape {
     pub warpsz: usize,
+    pub nwarp: usize,
     pub max_block_dim: usize,
     pub max_grid: u32,
 }
@@ -309,20 +310,19 @@ impl Case {
         }
         if block_dim > shape.max_block_dim {
             return Err(format!(
-                "block_dim = {block_dim}，RTL 一次只激活 1 条 warp（最多 {} 个线程，P3 才有调度器）",
+                "block_dim = {block_dim}，RTL 一个 block 最多 {} 个线程",
                 shape.max_block_dim
             ));
         }
-        if self.spec.nwarp * self.spec.warpsz != block_dim {
+        if self.spec.nwarp > shape.nwarp {
             return Err(format!(
-                "block_dim = {block_dim} 只占 {} 条 warp（共 {} 条），RTL 现在还只跑满 block（P3）",
-                block_dim / shape.warpsz,
-                self.spec.nwarp
+                "case 里 nwarp = {}，RTL 只有 {} 条 warp",
+                self.spec.nwarp, shape.nwarp
             ));
         }
         if self.spec.grid > shape.max_grid {
             return Err(format!(
-                "grid = {}，RTL 还是单 block（P3/P6）",
+                "grid = {}，RTL 还是单 block（多 block 在 P6）",
                 self.spec.grid
             ));
         }
@@ -337,6 +337,10 @@ impl Case {
         let image = dir.join(format!("{stem}.bin"));
         write_words(&image, &self.program_words()?)?;
         let mut args = vec!["--image".to_string(), image.display().to_string()];
+        args.push("--bdim".to_string());
+        args.push(format!("{}", self.block_dim()));
+        args.push("--nwarp".to_string());
+        args.push(format!("{}", self.spec.nwarp));
         let mut sregs: Vec<(&String, &u32)> = self.spec.sreg.iter().collect();
         sregs.sort();
         for (name, value) in sregs {

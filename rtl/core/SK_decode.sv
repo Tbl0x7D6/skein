@@ -159,6 +159,36 @@ module SK_decode (
         if ((cls == CLS_R || ctrl_o.op == SK_OP_SREAD) && pred > PRED_MAX) begin
             ctrl_o.op = SK_OP_ILLEGAL;
         end
+
+        // 读哪些 GPR、写不写 rd：scoreboard 的 RAW/WAR 检查和这两组位对齐
+        // （docs/design.md §7）。这里只列真实用到的操作数，宁可少标也不能多标。
+        unique case (ctrl_o.op)
+            SK_OP_ALU: begin
+                ctrl_o.srcs  = ctrl_o.imm_sel ? 3'b001 : 3'b011;
+                ctrl_o.wr_rd = 1'b1;
+                if (!ctrl_o.imm_sel && ctrl_o.alu_op == SK_ALU_FMA) begin
+                    ctrl_o.srcs[2] = 1'b1;      // FMA 的 rd 是累加器，先读后写
+                end
+            end
+            SK_OP_CMP:   ctrl_o.srcs = 3'b011;
+            SK_OP_SEL:   begin ctrl_o.srcs = 3'b011; ctrl_o.wr_rd = 1'b1; end
+            SK_OP_LOAD:  begin ctrl_o.srcs = 3'b001; ctrl_o.wr_rd = 1'b1; end
+            SK_OP_STORE: ctrl_o.srcs = 3'b101;      // ra 是基址，rd 是要写出去的数据
+            SK_OP_MASK: begin
+                unique case (ctrl_o.mask_op)
+                    SK_MASK_SAVE, SK_MASK_CLR_P: ;
+                    SK_MASK_AND, SK_MASK_ANDN, SK_MASK_OR: ctrl_o.srcs = 3'b011;
+                    default: ctrl_o.srcs = 3'b001;
+                endcase
+                ctrl_o.wr_rd = (ctrl_o.mask_op != SK_MASK_REST)
+                            && (ctrl_o.mask_op != SK_MASK_CLR_P);
+            end
+            SK_OP_BRZ, SK_OP_BRNZ: ctrl_o.srcs = 3'b001;   // 读 lane 0 的寄存器
+            SK_OP_SREAD: ctrl_o.wr_rd = 1'b1;
+            SK_OP_SHFL:  begin ctrl_o.srcs = 3'b011; ctrl_o.wr_rd = 1'b1; end
+            SK_OP_VOTE:  ctrl_o.wr_rd = 1'b1;
+            default: ;
+        endcase
     end
 
 endmodule

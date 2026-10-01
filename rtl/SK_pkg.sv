@@ -74,13 +74,24 @@ package SK_pkg;
     /// VOTE 的 func。
     localparam logic [3:0] SK_VOTE_ANY = 4'd0, SK_VOTE_ALL = 4'd1;
 
-    /// 特殊寄存器编号（和 tools/src/isa.rs 的 Sreg 同码）；15 保留。
+    /// 特殊寄存器编号：完整清单在 tools/src/isa.rs 的 Sreg（编号的唯一来源，两个文件
+    /// 必须同码）。RTL 只列自己译码时要用的几个——其余编号（PTR_*/ARG* 等）是主机写、
+    /// 由 `sreg_i` 直接读出来的，核不需要知道它们叫什么。
     /// 单个编号是数组下标（4 位），`SK_SREG_MAX` 要和译码里的 5 位 `ra` 比，所以是 5 位。
-    localparam logic [3:0] SK_SREG_TID    = 4'd0,
-                           SK_SREG_LANEID = 4'd1,
-                           SK_SREG_WID    = 4'd2,
-                           SK_SREG_WARPSZ = 4'd3;
-    localparam logic [4:0] SK_SREG_MAX    = 5'd14;
+    localparam logic [3:0] SK_SREG_TID       = 4'd0,
+                           SK_SREG_LANEID    = 4'd1,
+                           SK_SREG_WID       = 4'd2,
+                           SK_SREG_WARPSZ    = 4'd3,
+                           SK_SREG_BLOCK_DIM = 4'd14;
+    localparam logic [4:0] SK_SREG_MAX       = 5'd14;
+
+    /// 调度器里一个 warp 的状态。`BAR` 是"到了屏障在等"，`DONE` 是"EXIT 了或者
+    /// 这次 block 没让它起来"。见 docs/design.md §7。
+    typedef enum logic [1:0] {
+        SK_WARP_RUN  = 2'd0,
+        SK_WARP_BAR  = 2'd1,
+        SK_WARP_DONE = 2'd2
+    } sk_warp_state_e;
 
     /// 译码结果：执行级的全部控制信号。
     typedef struct packed {
@@ -100,7 +111,27 @@ package SK_pkg;
         logic        mem_global;  // LDG/STG
         logic [31:0] imm;         // 已扩展的立即数 / 访存偏移
         logic [31:0] off;         // 已符号扩展的跳转偏移（单位：指令字）
+        logic [2:0]  srcs;        // 读哪些 GPR：bit0 = ra、bit1 = rb、bit2 = rd
+        logic        wr_rd;       // 写 GPR rd（CMP 写的是谓词，不算）
     } sk_ctrl_t;
+
+    /// ID/EX 里真正要带到执行级的控制信号：`ra`/`pinv`/`srcs`/`wr_rd` 只在译码级
+    /// （读寄存器地址、`@!p` 门控、scoreboard 冒险检查）用得到，不占流水线寄存器。
+    typedef struct packed {
+        sk_op_e      op;
+        sk_alu_e     alu_op;
+        sk_cmp_e     cmp_op;
+        sk_mask_e    mask_op;
+        logic [1:0]  bop;
+        logic [4:0]  rd;
+        logic [4:0]  rb;
+        logic [3:0]  pred;
+        logic [3:0]  func;
+        logic [4:0]  sreg;
+        logic        mem_global;
+        logic [31:0] imm;
+        logic [31:0] off;
+    } sk_exec_t;
 
     /// 12 位立即数符号扩展。
     function automatic logic [31:0] sk_sext12(logic [11:0] value);

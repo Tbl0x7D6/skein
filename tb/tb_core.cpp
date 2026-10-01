@@ -1,21 +1,22 @@
-//! 单 warp 核的 Verilator testbench：喂输入、跑到底、dump 状态。
+//! SK_core 的 Verilator testbench：喂输入、跑到底、dump 状态。
 //!
 //! 这里不做比对——`skein-case`（tools/src/bin/skein-case.rs）把这份 dump 和黄金模型逐项
 //! 比对。testbench 只负责：装载 IMEM 镜像和 shared/global 初态、驱动特殊寄存器、
 //! 跑到 done 或者报错，然后按 --mem-window 把架构状态和内存窗口写成 JSON，
-//! 字段和 `skein-run --dump-state` 对齐（多一个 "mem"）。
+//! 字段和 `skein-run --dump-state` 对齐（多一个 "mem" 和 "perf"）。
 //!
 //! 用法：
-//!   tb_core --image <image.bin> [--set NAME=VALUE]...
+//!   tb_core --image <image.bin> [--bdim N] [--nwarp N] [--set NAME=VALUE]...
 //!           [--gmem-init ADDR FILE]... [--smem-init ADDR FILE]...
 //!           [--mem-window SPACE ADDR WORDS]... [--max-cycles N] [--trace]
 //!           [--dump-state <file>] [--dump-wave <file.fst>]
 //!   tb_core --print-shape                      # 只打印核的形状，不跑
 //!
-//! 形状来自核的 `shape_o`：warp 大小是 `SK_NUM_LANES` 个 lane，一次启动只激活 1 条
-//! warp（P2；多 warp 在 P3）。`skein-case` 先用 `--print-shape` 探形状，超过这个形状的
-//! case 报 SKIP。`WARPSZ = SK_NUM_LANES`、`BLOCK_DIM = WARPSZ`、`NWARP = GRID = 1`、
-//! `BID = WID = 0`，`TID/LANEID` 由核按 lane 算。
+//! 形状来自核的 `shape_o`：warp 大小 `SK_NUM_LANES`、warp 数 `SK_NUM_WARPS`。
+//! `skein-case` 先用 `--print-shape` 探形状，超过这个形状的 case 报 SKIP。
+//! `WARPSZ`/`GRID`/`BID` 由这里驱动，`NWARP` 默认报硬件容量、也可以用 `--nwarp` 改
+//! （case 模拟的机器更小的时候）；`BLOCK_DIM` 默认用满容量、也可以用 `--bdim` 给小
+//! 一点的 block。`TID/LANEID/WID` 由核按 warp 和 lane 算。
 //!
 //! `--dump-wave` 要带波形支持的模型（`make tb-trace` 出来的 `tb_core_trace`），普通
 //! 模型的时序逻辑不带 trace 代码，用它会直接报错。
@@ -45,11 +46,23 @@ constexpr uint32_t GMEM_BYTES = 1 << 20;
 // 调试扫描口（见 rtl/core/SK_core.sv）
 constexpr uint8_t DBG_M = 0x20;
 constexpr uint8_t DBG_PRED = 0x21;
-constexpr uint8_t DBG_PC_E = 0x22;
+constexpr uint8_t DBG_PC_ARCH = 0x22;
 constexpr uint8_t DBG_STATUS = 0x23;
 constexpr uint8_t DBG_INSN = 0x24;
 constexpr uint8_t DBG_RUN = 0x25;
-constexpr uint8_t DBG_PC_ARCH = 0x26;
+constexpr uint8_t DBG_PC_S4 = 0x26;
+constexpr uint8_t DBG_S4_WID = 0x28;
+constexpr uint8_t DBG_PERF = 0x30;
+
+/// 性能计数器的下标（和 rtl/perf/SK_perf.sv 一致）。
+constexpr int PERF_CYCLE = 0;
+constexpr int PERF_ISSUED = 1;
+constexpr int PERF_RETIRED = 2;
+constexpr int PERF_REPLAY = 3;
+constexpr int PERF_BARRIER = 4;
+constexpr int PERF_STALL_NO_WARP = 5;
+constexpr int PERF_LSU_BUSY = 6;
+constexpr int NUM_PERF = 7;
 
 // 特殊寄存器编号，和 tools/src/isa.rs 的 Sreg 一致
 constexpr int SREG_TID = 0x00;
@@ -71,11 +84,22 @@ constexpr int SREG_BLOCK_DIM = 0x0E;
 constexpr int NUM_GPR = 32;
 constexpr int NUM_PRED = 8;
 
-/// 核的形状：warp 大小、一次启动的 block 容量、block 数容量（来自 `SK_core.shape_o`）。
+/// 核的形状：warp 大小、warp 数、一次启动的 block 容量、block 数容量
+/// （来自 `SK_core.shape_o`）。
 struct Shape {
     uint32_t warpsz = 1;
+    uint32_t nwarp = 1;
     uint32_t max_block_dim = 1;
     uint32_t max_grid = 1;
+};
+
+/// 跑完之后一条 warp 的架构状态。
+struct WarpState {
+    uint32_t wid = 0;
+    uint32_t pc = 0;
+    uint32_t m = 0;
+    std::vector<std::vector<uint32_t>> gpr;
+    std::vector<uint32_t> pred;
 };
 
 struct SregValue {
@@ -105,12 +129,14 @@ struct Options {
     std::string state;
     std::string wave;
     long max_cycles = 200000;
+    long bdim = 0;              // 0 = 用满容量
+    long nwarp = 0;             // 0 = 报硬件容量
     bool trace = false;
     bool print_shape = false;
 };
 
 void usage() {
-    std::cerr << "用法：tb_core --image <image.bin> [--set NAME=VALUE]... "
+    std::cerr << "用法：tb_core --image <image.bin> [--bdim N] [--nwarp N] [--set NAME=VALUE]... "
                  "[--gmem-init ADDR FILE]... [--smem-init ADDR FILE]... "
                  "[--mem-window SPACE ADDR WORDS]... [--max-cycles N] [--trace] "
                  "[--dump-state <file>] [--dump-wave <file.fst>]\n"
@@ -201,6 +227,12 @@ bool parse_args(int argc, char** argv, Options& opt) {
         } else if (arg == "--max-cycles") {
             if (!need(1)) return false;
             opt.max_cycles = strtol(argv[++i], nullptr, 0);
+        } else if (arg == "--bdim") {
+            if (!need(1)) return false;
+            opt.bdim = strtol(argv[++i], nullptr, 0);
+        } else if (arg == "--nwarp") {
+            if (!need(1)) return false;
+            opt.nwarp = strtol(argv[++i], nullptr, 0);
         } else if (arg == "--trace") {
             opt.trace = true;
         } else if (arg == "--print-shape") {
@@ -266,11 +298,10 @@ bool apply_init(const MemInit& init, std::vector<uint32_t>& smem, std::vector<ui
     return true;
 }
 
-/// 状态 + 内存窗口写成 JSON（形状对齐 skein-run --dump-state）。
-/// `gpr[lane][reg]`、`pred[lane]` 是每 lane 一份，`m` 是 N 位执行 mask。
+/// 状态 + 内存窗口写成 JSON（形状对齐 skein-run --dump-state，多一个 "perf"）。
+/// 每条 warp 的 `gpr[lane][reg]`、`pred[lane]` 是每 lane 一份，`m` 是 N 位执行 mask。
 bool write_state(const Options& opt, const Shape& shape, uint32_t status, long cycles,
-                 const std::vector<std::vector<uint32_t>>& gpr,
-                 const std::vector<uint32_t>& pred, uint32_t m, uint32_t pc,
+                 const std::vector<WarpState>& warps, const uint32_t* perf,
                  const std::vector<uint32_t>& smem, const std::vector<uint32_t>& gmem) {
     std::ofstream out(opt.state);
     if (!out) {
@@ -281,25 +312,39 @@ bool write_state(const Options& opt, const Shape& shape, uint32_t status, long c
     out << "  \"status\": " << status << ",\n";
     out << "  \"cycles\": " << cycles << ",\n";
     out << "  \"warpsz\": " << shape.warpsz << ",\n";
+    out << "  \"nwarp\": " << shape.nwarp << ",\n";
+    out << "  \"perf\": {";
+    out << "\"cycles\": " << perf[PERF_CYCLE]
+        << ", \"issued\": " << perf[PERF_ISSUED]
+        << ", \"retired\": " << perf[PERF_RETIRED]
+        << ", \"replay\": " << perf[PERF_REPLAY]
+        << ", \"barriers\": " << perf[PERF_BARRIER]
+        << ", \"stall_no_warp\": " << perf[PERF_STALL_NO_WARP]
+        << ", \"lsu_busy\": " << perf[PERF_LSU_BUSY] << "},\n";
     out << "  \"warps\": [\n";
-    out << "    {\n      \"wid\": 0,\n      \"pc\": " << pc << ",\n      \"m\": " << m << ",\n";
-    out << "      \"gpr\": [";
-    for (size_t lane = 0; lane < gpr.size(); lane++) {
-        out << (lane ? ", [" : "[");
-        for (size_t reg = 0; reg < gpr[lane].size(); reg++) {
-            out << (reg ? ", " : "") << gpr[lane][reg];
+    for (size_t index = 0; index < warps.size(); index++) {
+        const WarpState& warp = warps[index];
+        out << "    {\n      \"wid\": " << warp.wid << ",\n      \"pc\": " << warp.pc
+            << ",\n      \"m\": " << warp.m << ",\n";
+        out << "      \"gpr\": [";
+        for (size_t lane = 0; lane < warp.gpr.size(); lane++) {
+            out << (lane ? ", [" : "[");
+            for (size_t reg = 0; reg < warp.gpr[lane].size(); reg++) {
+                out << (reg ? ", " : "") << warp.gpr[lane][reg];
+            }
+            out << "]";
         }
-        out << "]";
-    }
-    out << "],\n      \"pred\": [";
-    for (size_t lane = 0; lane < pred.size(); lane++) {
-        out << (lane ? ", [" : "[");
-        for (int i = 0; i < NUM_PRED; i++) {
-            out << (i ? ", " : "") << ((pred[lane] >> i) & 1u);
+        out << "],\n      \"pred\": [";
+        for (size_t lane = 0; lane < warp.pred.size(); lane++) {
+            out << (lane ? ", [" : "[");
+            for (int i = 0; i < NUM_PRED; i++) {
+                out << (i ? ", " : "") << ((warp.pred[lane] >> i) & 1u);
+            }
+            out << "]";
         }
-        out << "]";
+        out << "]\n    }" << (index + 1 == warps.size() ? "" : ",") << "\n";
     }
-    out << "]\n    }\n  ],\n";
+    out << "  ],\n";
     out << "  \"mem\": [\n";
     for (size_t index = 0; index < opt.windows.size(); index++) {
         const MemWindow& window = opt.windows[index];
@@ -335,6 +380,7 @@ int main(int argc, char** argv) {
     dut->imem_addr_i = 0;
     dut->imem_wdata_i = 0;
     dut->dbg_addr_i = 0;
+    dut->dbg_wid_i = 0;
     dut->dbg_lane_i = 0;
     for (int i = 0; i < 16; i++) {
         dut->sreg_i[i] = 0;
@@ -343,24 +389,26 @@ int main(int argc, char** argv) {
 
     Shape shape;
     shape.warpsz = dut->shape_o & 0xffu;
-    shape.max_block_dim = shape.warpsz;   // P2：一次只有 1 条 warp（P3 接调度器后放宽）
-    shape.max_grid = 1;                   // P2：一个 block
-    if (shape.warpsz == 0) {
-        std::cerr << "核报了 warpsz = 0\n";
+    shape.nwarp = (dut->shape_o >> 8) & 0xffu;
+    shape.max_block_dim = shape.warpsz * shape.nwarp;
+    shape.max_grid = 1;                   // P3：一个 block（grid > 1 在 P6）
+    if (shape.warpsz == 0 || shape.nwarp == 0) {
+        std::cerr << "核报了 warpsz = 0 或者 nwarp = 0\n";
         return 2;
     }
     if (opt.print_shape) {
-        printf("{\"warpsz\": %u, \"max_block_dim\": %u, \"max_grid\": %u}\n", shape.warpsz,
-               shape.max_block_dim, shape.max_grid);
+        printf("{\"warpsz\": %u, \"nwarp\": %u, \"max_block_dim\": %u, \"max_grid\": %u}\n",
+               shape.warpsz, shape.nwarp, shape.max_block_dim, shape.max_grid);
         delete dut;
         return 0;
     }
 
-    // WARPSZ = 硬件 warp 大小，BLOCK_DIM = 一条满 warp，NWARP = GRID = 1，BID = WID = 0；
-    // TID/LANEID 由核按 lane 算
+    // WARPSZ / NWARP 是硬件容量，BLOCK_DIM 默认用满（也可以 --bdim 给小一点的 block），
+    // GRID = 1、BID = 0；TID/LANEID/WID 由核按 warp 和 lane 算
+    uint32_t bdim = opt.bdim > 0 ? (uint32_t)opt.bdim : shape.max_block_dim;
     dut->sreg_i[SREG_WARPSZ] = shape.warpsz;
-    dut->sreg_i[SREG_NWARP] = 1;
-    dut->sreg_i[SREG_BLOCK_DIM] = shape.max_block_dim;
+    dut->sreg_i[SREG_NWARP] = opt.nwarp > 0 ? (uint32_t)opt.nwarp : shape.nwarp;
+    dut->sreg_i[SREG_BLOCK_DIM] = bdim;
     dut->sreg_i[SREG_GRID] = 1;
     for (const SregValue& sreg : opt.sregs) {
         dut->sreg_i[sreg.index] = sreg.value;
@@ -472,30 +520,55 @@ int main(int argc, char** argv) {
     long cycles = 0;
     while (!dut->done_o && cycles < opt.max_cycles) {
         low_phase();
-        if (opt.trace && (dbg(DBG_RUN) & 1u)) {
-            printf("cyc=%-4ld pc=%04x insn=%08x m=%02x\n", cycles, dbg(DBG_PC_E), dbg(DBG_INSN),
-                   dbg(DBG_M));
+        if (opt.trace && (dbg(DBG_RUN) & 1u)) {   // bit0 = 在跑
+            uint32_t s4 = dbg(DBG_S4_WID);
+            uint32_t wid = s4 & 0x3u;             // {valid, wid}：低 2 位是 wid
+            uint32_t pc = dbg(DBG_PC_S4);
+            uint32_t insn = dbg(DBG_INSN);
+            if (s4 & 4u) {                   // bit2 = 这一级真的有指令
+                dut->dbg_wid_i = wid;        // 顺便看一眼这条 warp 现在的 M
+                uint32_t m = dbg(DBG_M);
+                dut->dbg_lane_i = 0;
+                uint32_t pred = dbg(DBG_PRED);
+                uint32_t r25 = dbg(25);
+                printf("cyc=%-4ld w%u pc=%04x insn=%08x m=%x p=%x r25=%x\n", cycles, wid, pc,
+                       insn, m, pred, r25);
+                dut->dbg_wid_i = 0;
+            }
         }
         clock_edge();
         cycles++;
     }
 
-    // 按 lane 扫一遍：GPR 和谓词都是每 lane 一份，M 是 N 位
-    std::vector<std::vector<uint32_t>> gpr(shape.warpsz);
-    std::vector<uint32_t> pred(shape.warpsz, 0);
-    for (uint32_t lane = 0; lane < shape.warpsz; lane++) {
-        dut->dbg_lane_i = lane;
-        for (int i = 0; i < NUM_GPR; i++) {
-            gpr[lane].push_back(dbg((uint8_t)i));
+    // 按 warp × lane 扫一遍：GPR 和谓词都是每 (warp, lane) 一份，M 是每 warp N 位
+    std::vector<WarpState> warps;
+    for (uint32_t wid = 0; wid < shape.nwarp; wid++) {
+        WarpState warp;
+        warp.wid = wid;
+        dut->dbg_wid_i = wid;
+        warp.pc = dbg(DBG_PC_ARCH);
+        warp.m = dbg(DBG_M);
+        for (uint32_t lane = 0; lane < shape.warpsz; lane++) {
+            dut->dbg_lane_i = lane;
+            std::vector<uint32_t> gpr;
+            for (int i = 0; i < NUM_GPR; i++) {
+                gpr.push_back(dbg((uint8_t)i));
+            }
+            warp.gpr.push_back(gpr);
+            warp.pred.push_back(dbg(DBG_PRED));
         }
-        pred[lane] = dbg(DBG_PRED);
+        warps.push_back(warp);
+    }
+    dut->dbg_wid_i = 0;
+    dut->dbg_lane_i = 0;
+    uint32_t perf[NUM_PERF] = {};
+    for (int i = 0; i < NUM_PERF; i++) {
+        perf[i] = dbg((uint8_t)(DBG_PERF + i));
     }
     uint32_t status = dbg(DBG_STATUS);
-    uint32_t m = dbg(DBG_M);
-    uint32_t pc = dbg(DBG_PC_ARCH);
 
     if (!opt.state.empty()) {
-        if (!write_state(opt, shape, status, cycles, gpr, pred, m, pc, smem, gmem)) {
+        if (!write_state(opt, shape, status, cycles, warps, perf, smem, gmem)) {
             return 2;
         }
     }

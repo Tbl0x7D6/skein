@@ -90,8 +90,8 @@ pub struct Machine {
     /// 模拟器的死循环保护被触发（不是硬件状态）。
     pub limit_hit: bool,
     /// warpSize（`S_WARPSZ`）。
-    warpsz: usize,
-    nwarp: usize,
+    pub warpsz: usize,
+    pub nwarp: usize,
     /// 主机给的 block 线程数（`S_BLOCK_DIM`），已解析成具体值。
     block_dim: usize,
     grid: u32,

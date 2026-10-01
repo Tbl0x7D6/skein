@@ -32,7 +32,8 @@ close $fh
 
 # 出上下文综合：核的端口有 800+ 位（sreg / 访存 / 扫描口），当顶层会撞 I/O 上限。
 # OOC 不插 I/O buffer，逻辑照样保留（上板时它会被包进 SK_top）。
-read_verilog -sv $defines [glob rtl/SK_pkg.sv rtl/lib/*.sv rtl/core/*.sv rtl/mem/*.sv]
+read_verilog -sv $defines [glob rtl/SK_pkg.sv rtl/lib/*.sv rtl/core/*.sv rtl/mem/*.sv \
+                               rtl/sched/*.sv rtl/perf/*.sv]
 synth_design -top SK_core -part $part -include_dirs rtl -flatten_hierarchy rebuilt -mode out_of_context
 create_clock -period $period -name aclk [get_ports clk]
 opt_design
