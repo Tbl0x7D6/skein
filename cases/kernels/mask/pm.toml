@@ -1,0 +1,8 @@
+# mask 指令：.PM 同拍写 rd 和 M（单 warp × 4 lane）
+program = "pm.s"
+warpsz = 4
+nwarp = 1
+block_dim = 4
+
+[expect]
+status = "OK"

@@ -1,0 +1,8 @@
+# warp 协作：SHFL.UP 前缀和（单 warp × 4 lane）
+program = "shfl_prefix.s"
+warpsz = 4
+nwarp = 1
+block_dim = 4
+
+[expect]
+status = "OK"

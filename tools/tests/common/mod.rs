@@ -1,4 +1,8 @@
 //! 测试公用：汇编一段源码并跑黄金模型。
+//!
+//! isa.rs 用内联汇编，kernels.rs 全部从 cases/ 装载；共用的 helper 在另一个测试
+//! 二进制里会"未使用"，这里统一关掉 dead_code 警告。
+#![allow(dead_code)]
 
 use skein::asm;
 use skein::golden::{Config, Machine};

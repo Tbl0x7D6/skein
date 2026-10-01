@@ -142,8 +142,9 @@ BAD_INSN / PC_OOB 两个错误码用例和单 lane 版 vecadd，状态与黄金�
 - `rtl/core/SK_mask.sv`：`M`（N 位）+ GPR 操作数的 mask 指令
   （`MSAVE/MREST/MMOV/MAND/MANDN/MOR/MNOT/MAND.P/MANDN.P/MOR.P/MCLR.P/
   MAND.PM/MANDN.PM/MOR.PM`）；`.P`/`.PM` 只用 `M` 过滤谓词，`.PM` 同拍写 `M`。
-- 统一分支：`BRZ/BRNZ` 在译码级解析（GPR 里的 mask 值已知），`JMP` 无条件跳转。
-- kernel 集成：`cases/kernels/` 里的手写 mask 程序直接生成可上板的 IMEM 镜像。
+- 统一分支：`BRZ/BRNZ` 在 S4 执行级解析（GPR 里的 mask 值在流水里已知，见 P3 的
+  五级流水），`JMP` 无条件跳转。
+- kernel 集成：`cases/kernels/mask/` 里的手写 mask 程序直接生成可上板的 IMEM 镜像。
 - `SHFL.IDX/UP/DOWN/BFLY`：执行级的 N×N lane 交换网络（`src_lane` 由 `rb` 算，
   越界或源 lane 不在 `M` 里时返回自己的值）。
 - `VOTE.ANY/ALL`：`M & pred_word` 后面的 OR/AND 树，结果写所有 lane 的 GPR，
@@ -156,13 +157,18 @@ BAD_INSN / PC_OOB 两个错误码用例和单 lane 版 vecadd，状态与黄金�
     else 路径的 lane 不能被误删。
   - `.PM`：`rd` 和 `M` 同拍更新，且用的是旧 `M`；结果被 `& full` 夹住。
   - mask 指令的 GPR 操作数要求 warp 一致（模型侧检查，硬件不查）。
-  - 汇编器静态检查（可选，见 P0 状态）：`BAR` 在收窄 mask 区域、跨层 `break/continue`、
-    mask GPR 压力告警。
+  - 汇编器静态检查：不做（P0 已定 asm 只做编码转换），控制流正确性靠模板、用例和审查。
   - 不变式：每个 `ENDIF`/循环出口后，`M` 恢复到预期值；没有 lane 被永久丢失。
 
-**验收**：结构化控制流测试与黄金模型逐 lane 状态一致；所有非法程序被汇编器拒绝；
-mask 指令计数和理论值一致（汇编器的开销可见、可统计）；warp 内归约（`SHFL.BFLY`
-求和、`SHFL.UP` 前缀和）和 `VOTE` 分叉与黄金模型一致。
+**验收**：结构化控制流与 warp 协作（`SHFL.BFLY` 求和、`SHFL.UP` 前缀和、
+`VOTE.ANY/ALL` 分叉）在 RTL 和黄金模型上逐 lane 状态一致；非法指令/操作数由汇编器
+按现有规则拒绝（不做控制流静态检查）；IF/ELSE 模板的 MASK 类指令计数由测试钉住
+（9 条，模板改动会立刻反映）。
+
+**状态**：已完成。`cases/kernels/mask/` 11 条程序（发散/嵌套/无 ELSE 的 IF、统一退出和
+按 lane 退出的循环、continue、break、`.PM`、`SHFL`、`VOTE`）双仿真器对拍通过，
+`make rtl-sim` 25 PASS / 0 SKIP / 0 FAIL；`make test` 39 条 ISA + 14 条 kernel + 2 条
+case 用例。
 
 ## P5 — 内存层次
 
@@ -239,7 +245,7 @@ case 文件本身解析。
 cases/
   directed/          单条指令或小序列的定向用例（单 warp × 4 lane，RTL 全跑）
   errors/            错误码：保留编码、非对齐、取指越界（只比 status/trap）
-  kernels/<kernel>/  真 kernel 的用例，按 kernel 分目录（vecadd / matmul）
+  kernels/<kernel>/  真 kernel 的用例，按 kernel 分目录（vecadd / matmul / mask）
 ```
 
 ```toml

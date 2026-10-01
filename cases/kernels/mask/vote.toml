@@ -1,0 +1,8 @@
+# warp 协作：VOTE.ANY/ALL 的结果直接接 BRZ/BRNZ（单 warp × 4 lane）
+program = "vote.s"
+warpsz = 4
+nwarp = 1
+block_dim = 4
+
+[expect]
+status = "OK"

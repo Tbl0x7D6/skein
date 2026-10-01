@@ -1,0 +1,8 @@
+# mask 控制流：break 在 IF/ELSE 的 then 里，不误删 else 路径的 lane（单 warp × 4 lane）
+program = "break_in_then.s"
+warpsz = 4
+nwarp = 1
+block_dim = 4
+
+[expect]
+status = "OK"

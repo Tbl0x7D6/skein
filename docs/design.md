@@ -402,13 +402,15 @@ done:
         MREST     r24              ; 重汇聚
 ```
 
-三个要点：
+几个要点：
 
 - 两条分支 mask 都在切 `M` 之前算，读的是同一个入口 `M`（顺序现在不敏感，`.P` 不再
   对结果 `& M`，但放一起更清楚）。
 - merge 用 `MOR` 合并两条路径的**退出 mask**，不是直接 `MREST r24`。这样路径里的
   `break/continue` 收窄的 lane 不会在 merge 点被复活。
 - 没有 `ELSE` 时 else 路径什么都没做，它的退出 mask 就是 `r26` 本身，省一条 `MSAVE`。
+- 嵌套 `IF/ELSE` 就是递归套用同一模板：每层用一组新的 mask 寄存器（见
+  `cases/kernels/mask/if_nested.s`），深度上限受 §6.5 的 8 个 mask GPR 限制。
 
 ### 6.3 循环模板
 

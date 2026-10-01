@@ -23,7 +23,7 @@ make regress                                                    # 上面全跑�
 ```
 
 `make rtl-sim` 每行是 `case 名 + cycles + IPC`（`--stats` 还能看发射 / 提交 / 重发 /
-没发射 / LSU 排队的分解），14 个 case 全 PASS。想单独看某个 case 的性能计数器：
+没发射 / LSU 排队的分解），25 个 case 全 PASS。想单独看某个 case 的性能计数器：
 
 ```bash
 cargo run --manifest-path tools/Cargo.toml --bin skein-case -- \
