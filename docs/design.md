@@ -8,8 +8,8 @@
 | 项 | v0.1 目标 | 说明 |
 |---|---|---|
 | 功能 | 跑通 vecadd / reduction / sgemm 三类 kernel | 覆盖访存型与计算型 |
-| 规模 | 1 核，4 warp × 4 lane | warp 宽度 P2 定，见 §12.6 |
-| 频率 | 综合后 ≥ 200 MHz（U250，-2L） | 能收敛比频率重要；P2 的 2 级核还没到，见 §12.6 |
+| 规模 | 1 核，4 warp × 4 lane | warp 宽度 P2 起用 4、P3 用真实 WNS 复议，见 §12.6 |
+| 频率 | 综合后 ≥ 200 MHz（U250，-2L） | P3 的 5 级核 WNS +0.43 ns，见 §12.6 |
 | 面积 | ≤ 30K LUT（不含 BRAM） | 留出后续加 cache 的余量 |
 | 上板 | U250 上以 Vitis RTL kernel 形式运行 | P6 阶段 |
 
@@ -19,7 +19,7 @@ RTL 宏集中在 [SK_config.vh](../rtl/SK_config.vh)：
 
 ```systemverilog
 `define SK_XLEN        32      // 数据宽度
-`define SK_NUM_LANES    4      // warpSize；每个 warp 的 lane 数（P2 综合实验定，见 §12.6）
+`define SK_NUM_LANES    4      // warpSize；每个 warp 的 lane 数（P2 定、P3 复议，见 §12.6）
 `define SK_NUM_WARPS    4      // 每核 warp 数
 `define SK_NUM_GPR      32     // 每 lane 通用寄存器数（r0 恒为 0）
 `define SK_NUM_PRED     8      // 每 lane 谓词数
@@ -66,9 +66,10 @@ RTL 宏集中在 [SK_config.vh](../rtl/SK_config.vh)：
                  └─────────────────────────────────────────────────────────┘
 ```
 
-P2 落地的只是其中一部分：`SK_imem`、`SK_decode`、`SK_regfile`、`SK_alu`、`SK_mask`、
-`SK_lsu`，加一个 2 级的 `SK_core`（1 条 warp × N lane，见 §7）。图里其余模块（调度器、
-scoreboard、coalescer、AXI、上板壳）随 P3–P6 加，清单见 [plan.md](plan.md)。
+P3 落地的部分：`SK_imem`、`SK_decode`、`SK_regfile`、`SK_alu`、`SK_mask`、`SK_lsu`
+加一个 5 级 `SK_core`（4 条 warp × N lane，见 §7），调度/scoreboard/屏障在
+`rtl/sched/`，计数器在 `rtl/perf/`。图里其余模块（coalescer、AXI、上板壳）随
+P5–P6 加，清单见 [plan.md](plan.md)。
 
 ## 4. 执行模型
 
@@ -92,8 +93,8 @@ scoreboard、coalescer、AXI、上板壳）随 P3–P6 加，清单见 [plan.md]
   `BLOCK_DIM`（主机写的 `blockDim.x`）决定 block 有多少线程：`1 ≤ BLOCK_DIM ≤
   NWARP × WARPSZ` 且必须是 `WARPSZ` 的整数倍（不允许部分 warp），非法值在 start 时报
   `BAD_LAUNCH`。block 数由主机的 `GRID_DIM` 决定，`S_BID` 是当前 block 索引（只读），
-  对齐 `blockIdx`；shared/global 在 block 之间不清零。P2 的 RTL 只实现"1 条 warp、
-  1 个 block"，多 warp 调度和 `grid > 1` 在 P3。
+  对齐 `blockIdx`；shared/global 在 block 之间不清零。P3 的 RTL 实现多 warp、单 block，
+  `grid > 1` 在 P6。
 - **warp 的生成与结束**：硬件有 `NWARP` 条 warp、每条 `WARPSZ` 个 lane；一次启动只激活
   前 `BLOCK_DIM / WARPSZ` 条（每条都是满 warp），其余直接 done。每条 warp 从入口
   `0x0000` 开始执行；`EXIT` 是 warp 级指令，执行到就结束整条 warp；所有活跃 warp
@@ -481,30 +482,50 @@ break 的 lane 已经不在 `r25` 里，直到 `L_done` 的 `MREST r24` 才回�
 
 ## 7. 流水线
 
-v0.1 采用 5 级流水线；lane 数取 8 时可以在 S3/S4 之间加一级操作数读，变成 6 级：
+5 级流水（P3 起）：S1 调度 / S2 取指 / S3 译码 / S4 执行 / S5 提交，多条 warp 轮转。
 
-| 级 | 职责 |
-|---|---|
-| S1 Schedule | 轮询选 warp、发出 PC |
-| S2 Fetch | 从 IMEM 取指 |
-| S3 Decode | 译码、读寄存器和谓词；统一分支在这里解析（GPR 里的 mask 值已知） |
-| S4 Execute | ALU / LSU / mask / `SHFL`（lane 交换网络）/ `VOTE`（OR/AND 树）；LDG 发出后由 scoreboard 跟踪 |
-| S5 Commit | 受 `M` 和谓词门控写回；分支重定向、清年轻指令 |
+| 级 | 职责 | 流水寄存器 |
+|---|---|---|
+| S1 Schedule | `SK_scheduler` 轮询挑一条能发的 warp，把它的 PC 写进取指请求 | `f1_pc` / `f1_wid` |
+| S2 Fetch | IMEM（BRAM）一拍后出指令，和它的 PC 一起落到 IF/ID | `ifid_*` |
+| S3 Decode | 译码、组合读寄存器堆、读该 warp 的 `M`/谓词快照；scoreboard 查冒险，有冲突就重发 | `idex_*` |
+| S4 Execute | ALU / 访存地址 / 分支判定 / mask / `SHFL` / `VOTE`；访存请求在这里进 `SK_lsu` | `exwb_*` |
+| S5 Commit | 写寄存器堆、谓词、`M`；改 warp 状态（`BAR` / `EXIT`） | — |
 
-不预测分支：统一分支在 S3 解析，命中则重定向并清掉年轻指令；解析前该 warp 停止
-发射，其他 warp 继续。每个 warp 一个 scoreboard（4–8 个 slot）跟踪 `LDG` 的目标
-寄存器；`STG` 是 posted write，用 outstanding 计数在内核结束前排空。
+**每条 warp 最多一条指令在流水里**（`warp_busy`）：发射后要等 4 拍才轮到它再发射，
+所以寄存器堆的写一定在下一次读之前落地，不需要前递；也不会出现"某条指令卡在中间某一
+级、把这一级占死"的情况，每一级永远只服务一条在飞的指令。代价是单 warp 的 IPC 上限
+只有 0.2 上下，靠多 warp 轮流填（4 条 warp 时上限 0.8）。这是刻意的取舍：用最小面积
+换多 warp 藏延迟，前递 + 多条在飞留给以后真需要单 warp 吞吐的时候。
 
-P1/P2 先做 2 级：BRAM 取指一拍，加一个执行级，执行级同拍写回（寄存器堆是"写在下一条
-指令读之前"，不用前递）；统一分支也在这一级解析，命中就把在途的取指丢掉，代价是一个
-空泡。拆成 5 级和 P3 的调度器、scoreboard 一起做。
+取指是两级寄存器（`f1` 出地址、`f2` 对齐 PC）：BRAM 有一拍读延迟，PC 和指令必须一起
+进 IF/ID，否则译码拿到的是"下一条的 PC + 上一条的指令"。
 
-P2 的核是 1 条 warp × `SK_NUM_LANES` 个 lane：每 lane 一套寄存器和谓词，`SK_alu`
-按 lane 例化，写回、访存和谓词写按 `M & @p` 逐 lane 门控；`VOTE` 的结果广播给所有
-lane，`SHFL` 是 N×N 交换网络。访存是多周期的——一条 `LDS/STS/LDG/STG` 占
-`SK_NUM_LANES` 拍，按 lane 顺序每拍一条，期间冻结取指和执行级（译码结果存在
-`ctrl_e_q` 里），没有 active lane 也照走；这一步慢，P5 的合并器就是冲它去的。
-2 级流水在 200 MHz 下收不收敛（见 §12.6），拆流水线是 P3 的第一件事。
+**所有会卡住的情况都在 S3 查、查到就重发**（`replay`：这条指令丢成空泡、warp 的 PC
+退回去，别的 warp 照常发射）：
+
+- 读的寄存器还在等 `LDG`/`LDS` 的数据，或者要写的寄存器还在等老 load 写回来
+  （scoreboard，见下）；
+- 要发的是访存，但这条 warp 的访存请求槽还占着；
+- 要发的是 `BAR`/`EXIT`，但这条 warp 还有访存没排空。
+
+重发之后这条 warp 先等自己的访存排空再试（`warp_wait`），免得反复占用发射口空转。
+统一分支在 S4 解析（GPR 值来自 S3 的快照），直接改这条 warp 的 PC——每条 warp 只有
+一条指令在飞，不需要清年轻指令。`BAR`/`EXIT` 例外：它们要等**提交**（S5）才能让这条
+warp 再发射，否则 `EXIT` 后面那条 PC 已经越过程序末尾，会假报 `PC_OOB`。
+
+**访存非阻塞**：`LDG/LDS` 的目标寄存器进 scoreboard（每 warp 一份、按寄存器编号的
+bit），`STG/STS` 是 posted write；一条访存占 `SK_NUM_LANES` 拍（一拍一条 lane），
+每个 warp 一个请求槽，`SK_lsu` 轮询服务。谁读还在等的寄存器就重发，`EXIT`/`BAR`
+之前必须排空。scoreboard 的位在"这条请求最后一条 lane 做完"的那一拍清掉，同一拍译码
+的指令还会看到旧值，所以数据一定已经进了寄存器堆，不会差一拍（见 practice.md §1.9）。
+
+出错（访存出错 / 取指越界 / `BAD_INSN` / `BAR` 不完整）就停整台核；`STATUS` 和停下来
+的 PC 是契约，其余架构状态不作为保证（§5.5）。
+
+历史：P1/P2 是 2 级（BRAM 取指 + 一个执行级，同拍写回），单 warp × `SK_NUM_LANES`
+个 lane；2 级在 200 MHz 下收不收敛（§12.6），拆流水线是 P3 的第一件事。lane 数取 8
+时还可以在 S3/S4 之间加一级操作数读，变成 6 级。
 
 ## 8. 存储层次
 
@@ -518,8 +539,10 @@ lane，`SHFL` 是 N×N 交换网络。访存是多周期的——一条 `LDS/STS
 
 访存合并是性能的第一来源（P5 做）：同一 warp 内多条 active lane 的地址落在同一
 cache line 时合并成一次总线事务。v0.1 的 kernel 先用小工作集，性能差是预期行为。
-P2 的访存每拍只服务一条 lane、也不跳过 inactive lane（组合逻辑换面积和时间），
-所以一个访存核的 IPC 上限是 `1 / SK_NUM_LANES`；合并、bank 化和跳过空 lane 都在 P5。
+访存每拍只服务一条 lane、也不跳过 inactive lane（组合逻辑换面积和时间），一条
+`LDS/STS/LDG/STG` 固定占 `SK_NUM_LANES` 拍；P3 起每个 warp 有一个请求槽、整体非阻塞
+（`LDG` 的数据进 scoreboard，`STG` 是 posted write），所以流水线不用等它。合并、
+bank 化和跳过空 lane 都在 P5。
 
 ## 9. 主机接口（P6）
 
@@ -550,10 +573,15 @@ GPU 顶层做成标准 Vitis RTL kernel：
 - 是否需要 mask 零/非零之外的统一分支条件（v0.1 先不做，需要时再加指令）。
 - `SHFL.IDX` 的取模：v0.1 的 `WARPSZ` 是 4/8（2 的幂），硬件用低位掩码就够；将来
   `WARPSZ` 不是 2 的幂时要真取模（比较链或除法器）。
-- warp 宽度冻结在 4 lane（§12.6）：P3 拆完流水线、P5 有合并器之后再用真实 Fmax 和
-  带宽数据复议要不要上 8 lane。
+- warp 宽度冻结在 4 lane（§12.6）：P3 拆完流水线之后再看 Fmax 和 IPC 复议要不要上
+  8 lane（P5 有合并器之后收益才明显）。
 - IMEM 16 KB、shared 32 KB 是否够用；shared bank 数取 lane 数还是 2×lane 数。
-- scoreboard 需要多少个 outstanding slot。
+- 单 warp 的吞吐：现在每条 warp 最多一条指令在流水里（发射间隔 4 拍），换掉了前递和
+  "清年轻指令"。要让单 warp 也接近 1 IPC，得允许 2 条以上在飞 + 前递，复杂度上一个
+  台阶——等真出现"warp 不够多、又需要单 warp 吞吐"的场景再说。
+- 每个 warp 只有 1 个访存请求槽：`LDG; LDG; 用` 这种写法第二条要等前一条排空。要不要
+  给每个 warp 2–4 个槽（scoreboard 也跟着从"按寄存器"改成"按槽"），看 P5 合并器的
+  数据再定。
 - sgemm 是否需要 `MUL` 之外的整数除法，还是用移位/循环代替。
 - 字节/半字访存什么时候加（v0.1 只做 32 位字）。
 - 是否在 P5 加一个小 L1 或只做 coalescer。
@@ -602,11 +630,16 @@ shared memory（`LDS/STS`，16 位地址，片上 BRAM 多 bank）和 global mem
 （`LDG/STG`，32 位地址，AXI4）各自独立编址，指令本身区分空间。好处是访存路径
 清晰、不依赖地址译码；代价是两套访存指令和两套地址计算。
 
-### 12.5 寄存器堆用 LUTRAM，不用 BRAM
+### 12.5 寄存器堆不用 BRAM
 
-寄存器堆需要每 lane 3 读 1 写、组合读，BRAM 的端口数、延迟和粒度都不合适；
-LUTRAM/FF 阵列更匹配，也更容易随 lane 数扩展。BRAM 留给 shared memory、IMEM
-和以后的 cache。
+寄存器堆需要 3 个组合读口、每 warp 一个写口（P3 起 4 warp × 4 lane × 32 × 32b =
+16 Kbit），BRAM 的端口数和延迟都不合适。写成 `SK_regfile` 里的 FF 阵列后，Vivado 报
+`LUT as Memory ≈ 0`——它是按 FF + 读 mux 实现的，不是分布式 RAM：第一版没有刻意去套
+LUTRAM 模板（多读口 + 每 warp 独立写口 + 块开始清零都让推断不成立）。代价是面积
+（§12.6 里 24.5K LUT 的大头就是 16 个 lane 的读 mux），换来的是时序和结构都简单。
+真到面积吃紧的时候再按 3 份只读副本 + 单写口重写成分布式 RAM（P5 之后再说）。
+
+BRAM 留给 shared memory、IMEM 和以后的 cache。
 
 ### 12.6 起始配置 1 核 4 warp × 4 lane
 
@@ -630,6 +663,20 @@ P2 把核按 4/8/16 lane 各综合了一遍（`make synth`：xcu250、200 MHz �
 
 复议的时机：P3 拆完流水线（有可信的 Fmax）之后，用真实 IPC 和带宽数据再看要不要上
 8 lane；那之前 `SK_NUM_LANES` 保持 4。
+
+**P3 复议（拆成 5 级之后，同样的脚本、只统计核本身）：**
+
+| lane | LUT | FF | URAM | DSP | WNS @200 MHz |
+|---|---|---|---|---|---|
+| 4 | 24463 | 18662 | 1 | 12 | +0.43 ns |
+| 8 | 47471 | 36365 | 1 | 24 | +0.62 ns |
+| 16 | 89665 | 71918 | 1 | 48 | +0.46 ns |
+
+5 级流水把时序问题解决了：三个配置都收敛到 200 MHz（P2 的 2 级核是 −2.3…−2.8 ns）。
+但面积按 lane 数近似线性长（大头是 FF 实现的寄存器堆读 mux + 每 lane 一套 ALU），
+8 lane 已经 47K LUT，是 §1 里 30K 预算的 1.6 倍。再加上访存还是一拍一条 lane，
+lane 翻倍只会让每条 `LDS/STG` 更慢。所以仍然取 **4 lane**；要上 8 lane 的前提是
+先把寄存器堆做成分布式 RAM（§12.5），并且 P5 的合并器已经就位。
 
 ### 12.7 内存层次分步走
 
@@ -683,15 +730,25 @@ Vitis RTL kernel + XRT 是 Xilinx 官方支持的上板路线，平台、shell �
 
 | 组 | 计数 | 用途 |
 |---|---|---|
-| 周期/发射 | `CYCLE`、`INST_ISSUED`、`INST_RETIRED`、`WARP_READY`、`BLOCKS_DONE` | IPC = `INST_RETIRED / CYCLE`；M3 用同一个 kernel 跑 `NWARP = 1/2/4` 各一遍画曲线 |
-| 停顿（互斥） | `STALL_FETCH`、`STALL_SCOREBOARD`、`STALL_BRANCH`、`STALL_LSU`、`STALL_BAR`、`STALL_NO_WARP` | 判断 IPC 低是缺 warp 还是访存卡住 |
-| shared | `LDS_TXN`、`STS_TXN`、`LDS_REPLAY` | bank 冲突的代价 |
-| global/AXI | `AXI_RD_TXN`、`AXI_WR_TXN`、`AXI_RD_BEATS`、`AXI_WR_BEATS`、`AXI_RD_BYTES`、`AXI_WR_BYTES`、`AXI_STALL`、`LDG_INFLIGHT_MAX` | M5 的对比表：开/关 coalescer 各一行 |
+| 周期/发射 | `CYCLE`、`INST_ISSUED`、`INST_RETIRED`、`REPLAY`、`BARRIERS` | IPC = `INST_RETIRED / CYCLE`；M3 用同一个 kernel 跑 `NWARP = 1/2/4` 各一遍画曲线 |
+| 停顿 | `STALL_NO_WARP`、`LSU_BUSY` | 外加读的时候算的 `CYCLE - INST_ISSUED`（总共几拍没发射）：判断 IPC 低是缺 warp 还是访存没排空 |
+| shared | `LDS_TXN`、`STS_TXN`、`LDS_REPLAY` | bank 冲突的代价（P5） |
+| global/AXI | `AXI_RD_TXN`、`AXI_WR_TXN`、`AXI_RD_BEATS`、`AXI_WR_BEATS`、`AXI_RD_BYTES`、`AXI_WR_BYTES`、`AXI_STALL`、`LDG_INFLIGHT_MAX` | M5 的对比表：开/关 coalescer 各一行（P5） |
 
 - 黄金模型已经按分类统计指令条数（`skein-run --stats` 和 `--dump-state` 里的
-  `op_counts`），RTL 的 `INST_RETIRED` 分类要和它对得上——对不上就是 RTL 的 bug，这比
-  "结果正确"更早暴露吞吐问题。
-- RTL 侧：`SK_perf.sv` 放一组 32 位计数器，各流水级给 one-hot 事件；读出口复用
-  AXI-Lite（`PERF_ADDR`/`PERF_DATA` 一对寄存器，和 IMEM 装载口同一套），`CTRL.start`
-  清零、`done` 冻结。200 MHz 下 32 位要 20 s 才回绕，够用。
-- 落地阶段：`CYCLE`/`INST_*`/`STALL_*` 在 P3，`AXI_*` 在 P5（见 [plan.md](plan.md)）。
+  `op_counts`）；`skein-case` 拿 `INST_RETIRED` 的总数和黄金模型的 `steps` 对拍——
+  对不上就是 RTL 的 bug，这比"结果正确"更早暴露吞吐问题。按分类对拍（RTL 的
+  `INST_RETIRED[class]` 对 `op_counts`）留给 P5 和 AXI 计数器一起做。
+- RTL 侧：`SK_perf.sv` 放一组 32 位计数器，各流水级给 one-hot 事件；`CTRL.start`
+  清零、`done` 之后自然冻结。200 MHz 下 32 位要 20 s 才回绕，够用。
+- 读出口：P3 走调试扫描口（`0x30-0x39`，`tb_core` 把它 dump 进 case 的 `perf`），
+  P6 换成 AXI-Lite 的 `PERF_ADDR`/`PERF_DATA` 一对寄存器。
+- "没发射"只记两个量：总数用 `CYCLE - INST_ISSUED` 现算（不占计数器），
+  `STALL_NO_WARP` 数"一条 RUN 状态的 warp 都没有"（都在 BAR 上等 / 已经 EXIT）。
+  更细的"在等 load 数据 / 等访存槽 / 指令还没走完"不做了：同一拍几条 warp 各有各的
+  原因，硬摊到其中一条头上（早先按轮询指针取第一条）会随指针漂移，读数不可信。
+  要再看细的，就按 warp 分别计数——那是 P5 和带宽数据一起做的时候的事。
+- 没有 `STALL_FETCH`：IMEM 是单口 BRAM、发射级一拍一条，不存在取指排队。分支也只改
+  自己 warp 的 PC，不占整条流水，所以没有 `STALL_BRANCH`。
+- 落地阶段：`CYCLE`/`INST_*`/`STALL_*` 在 P3（已完成），`AXI_*` 在 P5（见
+  [plan.md](plan.md)）。

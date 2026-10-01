@@ -5,8 +5,8 @@ Skein 是一个从零手写的小型 SIMT 处理器（GPGPU），目标是把 FP
 
 指令集是自己设计的 32 位定长 ISA，不依赖现成编译器；kernel 用手写汇编，配一个
 汇编器和一个黄金模型。ISA 编码已经冻结（[design.md](docs/design.md) §5）；汇编器、
-黄金模型和测试在 `tools/`（Rust），核在 `rtl/`（P2 完成：1 条 warp × 4 lane），
-两者用同一份程序逐寄存器对拍。
+黄金模型和测试在 `tools/`（Rust），核在 `rtl/`（P3 完成：4 warp × 4 lane、5 级流水、
+非阻塞访存），两者用同一份程序逐寄存器对拍。
 
 ## 快速上手
 
@@ -20,6 +20,14 @@ make tb-trace                                                   # 编译带 FST 
 make wave CASE=cases/directed/sum.toml                          # 跑单个 case，波形 dump 到 build/sum.fst
 make synth                                                       # 按 lane 数扫综合/实现（Vivado，几分钟起步）
 make regress                                                    # 上面全跑一遍：fmt + clippy + test + lint + 仿真
+```
+
+`make rtl-sim` 每行是 `case 名 + cycles + IPC`（`--stats` 还能看发射 / 提交 / 重发 /
+没发射 / LSU 排队的分解），14 个 case 全 PASS。想单独看某个 case 的性能计数器：
+
+```bash
+cargo run --manifest-path tools/Cargo.toml --bin skein-case -- \
+    --rtl-tb build/obj_core/tb_core --stats cases/kernels/vecadd/warp4.toml
 ```
 
 ## 目标

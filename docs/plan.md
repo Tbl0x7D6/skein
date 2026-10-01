@@ -108,16 +108,29 @@ BAD_INSN / PC_OOB 两个错误码用例和单 lane 版 vecadd，状态与黄金�
 
 **交付物**
 
-- `rtl/sched/SK_scheduler.sv`：轮询调度，维护 warp 状态
-  （ready / stalled / barrier / done）。
-- `rtl/sched/SK_scoreboard.sv`：跟踪 `LDG` 的目标寄存器（4–8 个 slot）。
-- `SK_lsu.sv` 改为非阻塞：`LDG` 发出后 warp 让出流水线；`STG` posted write +
-  outstanding 计数，内核结束前必须排空。
-- `rtl/sched/SK_bar_unit.sv`：块内屏障（只在完整 mask 下执行，汇编器负责检查）。
-- 性能计数器：`CYCLE` / `INST_*` / `STALL_*` 一组，清单见
-  [design.md](design.md) §13；黄金模型的 `op_counts` 是 RTL 的对拍基准。
+- 核拆成 5 级：S1 调度 / S2 取指 / S3 译码 / S4 执行 / S5 提交，取指是两级寄存器
+  （BRAM 一拍延迟，PC 要和指令一起进 IF/ID）。每条 warp 最多一条指令在流水里：
+  发射间隔 4 拍，寄存器堆写一定在下一次读之前落地，所以**不做前递**，也不会中途卡住
+  某一级（design.md §7）。
+- `rtl/sched/SK_scheduler.sv`：轮询发射 + warp 状态（RUN / BAR / DONE）；
+  `rtl/sched/SK_bar_unit.sv`：块内屏障（所有还活着的 warp 到齐才放行）。
+- `rtl/sched/SK_scoreboard.sv`：每 warp 一份"哪些 GPR 在等 `LDG`/`LDS`"的 bit；
+  译码级查出 RAW / WAR 就把这条指令**重发**（丢空泡 + PC 回退），别的 warp 继续。
+- `rtl/core/SK_lsu.sv` 改成非阻塞：每 warp 一个请求槽，轮询服务，一拍一条 lane；
+  `LDG/LDS` 的数据回写到寄存器堆（和流水线提交抢同一个写口时让一拍），`STG/STS`
+  是 posted write，`BAR`/`EXIT` 之前必须排空。
+- `rtl/perf/SK_perf.sv`：`CYCLE` / `INST_ISSUED` / `INST_RETIRED` / `REPLAY` /
+  `BARRIERS` / `STALL_NO_WARP` / `LSU_BUSY`，清单见 [design.md](design.md) §13。
+- 用例框架：`perf` 进 dump，`skein-case` 报 IPC，`INST_RETIRED` 和黄金模型的 `steps`
+  对拍。
 
 **验收**：4 warp 并发跑 vecadd 结果正确；IPC > 0.5（单 warp 时应当 < 0.3）。
+这两条从报告里的 IPC 数字看，不写进 case——case 只描述输入和期望状态，
+吞吐是拿 `--stats` 观察的指标。
+
+**状态**：已完成。`make rtl-sim` 14 PASS / 0 SKIP / 0 FAIL（`vecadd/warp4` IPC 0.63、
+`matmul/rows16` 0.72、`vecadd/warp1` 0.19）；4 lane 的核在 200 MHz 下综合 WNS
++0.43 ns、24463 LUT / 18662 FF（数据见 design.md §12.6）。
 
 ## P4 — mask 控制流单元 + warp 协作指令
 
@@ -232,8 +245,8 @@ cases/
 ```toml
 program = "sum.s"           # 或 words = [0x3b, 0x3a]（汇编器编不出的编码）
 warpsz = 4                  # 默认 4 = SK_NUM_LANES（RTL 的硬件 warp 大小）
-nwarp = 1                   # 默认 4（硬件容量；RTL 现在一次只激活 1 条 warp）
-block_dim = 4               # 可选，默认用满容量（nwarp × warpsz）
+nwarp = 1                   # 默认 4（黄金模型模拟的机器容量；RTL 是 4）
+block_dim = 4               # 可选，默认用满容量（nwarp × warpsz）；RTL 按它激活 warp
 grid = 1
 max_steps = 100000          # 可选，黄金模型的步数上限
 
@@ -258,15 +271,23 @@ barriers = 1
 max_steps = 20480
 ```
 
+`[expect]` 只放语义和形状上的期望；IPC 这种吞吐指标不写进 case，跑完从报告里看
+（`make rtl-sim` 每行都带 IPC，`--stats` 再展开计数器）。
+
 - 形状：`skein-case` 先用 `tb_core --print-shape` 问一次核的容量（来自
   `SK_core.shape_o`），`warpsz` 对不上、`block_dim` 超过一次能激活的线程数、或者
   `grid > 1` 的 case 报 SKIP 并注明原因；runner 和 Makefile 里都不写死 lane 数。
 - `make rtl-sim`：每个 case 先跑黄金模型、再跑 RTL，逐项比 status / pc / `M` / GPR /
-  谓词 / `[[check]]` 窗口。
+  谓词 / `[[check]]` 窗口，外加 RTL 的 `INST_RETIRED` 和黄金模型的 `steps`、
+  `BARRIERS` 和黄金模型的屏障次数。
 - 黄金模型报错（`status != OK`）时只比 status 和 pc：出错之后哪些 lane 已经提交、
   内存写进去多少属于实现行为，不是架构契约（[design.md](design.md) §5.5），
   逐字节比只会得到假 FAIL。报告里会标出"只比 status/pc"。
-- 最后打印 PASS/SKIP/FAIL 计数和每个 case 的 RTL 周期数。
+- 最后打印 PASS/SKIP/FAIL 计数和每个 case 的 RTL 周期数、IPC；加 `--stats` 还能看
+  发射 / 提交 / 重发 / 没发射 / LSU 排队的分解（IPC 曲线和"为什么只有 0.6"都从
+  这里看）。
+- 核容量比 case 大时（4 条 warp 的核跑单 warp 用例），多出来的 warp 必须是"没跑过"
+  的样子（pc = 0、`M` = 完整 mask、GPR/谓词全 0），否则报 FAIL。
 - `make test` 里的 `tests/cases.rs` 不依赖 Verilator：每个 case 都跑一遍黄金模型并检查
   `[expect]`，保证 case 本身是有效的测试。
 - 调试单个 case：`cargo run --bin skein-run -- --case cases/directed/sum.toml --trace`；
