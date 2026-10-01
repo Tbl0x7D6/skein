@@ -701,6 +701,7 @@ fn error_unaligned_access() {
             EXIT
     ");
     assert_eq!(m.status, Status::Unaligned);
+    assert_eq!(m.fault, Some((0, 2)), "出错指令的 PC + 1");
 }
 
 #[test]
@@ -817,6 +818,7 @@ fn reserved_opcodes_are_rejected() {
 fn error_pc_out_of_range() {
     let m = run("NOP"); // 没有 EXIT，跑出 IMEM
     assert_eq!(m.status, Status::PcOob);
+    assert_eq!(m.fault, Some((0, 1)), "取指越界停在取不到的地址上");
 }
 
 #[test]

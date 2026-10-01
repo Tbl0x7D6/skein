@@ -268,6 +268,9 @@ fn main() -> ExitCode {
         machine.steps,
         machine.barriers
     );
+    if let Some((wid, pc)) = machine.fault {
+        println!("停在 w{wid} pc={pc}");
+    }
     if args.stats {
         let counts: Vec<String> = machine
             .op_counts()

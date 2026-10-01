@@ -238,7 +238,7 @@ case 文件本身解析。
 ```
 cases/
   directed/          单条指令或小序列的定向用例（单 warp × 4 lane，RTL 全跑）
-  errors/            错误码：保留编码、非对齐、取指越界（只比 status/pc）
+  errors/            错误码：保留编码、非对齐、取指越界（只比 status/trap）
   kernels/<kernel>/  真 kernel 的用例，按 kernel 分目录（vecadd / matmul）
 ```
 
@@ -280,9 +280,10 @@ max_steps = 20480
 - `make rtl-sim`：每个 case 先跑黄金模型、再跑 RTL，逐项比 status / pc / `M` / GPR /
   谓词 / `[[check]]` 窗口，外加 RTL 的 `INST_RETIRED` 和黄金模型的 `steps`、
   `BARRIERS` 和黄金模型的屏障次数。
-- 黄金模型报错（`status != OK`）时只比 status 和 pc：出错之后哪些 lane 已经提交、
-  内存写进去多少属于实现行为，不是架构契约（[design.md](design.md) §5.5），
-  逐字节比只会得到假 FAIL。报告里会标出"只比 status/pc"。
+- 黄金模型报错（`status != OK`）时只比 status 和 trap（`SK_core` 里"停在哪条 warp
+  的哪个 PC"的寄存器）：出错之后哪些 lane 已经提交、内存写进去多少属于实现行为，
+  不是架构契约（[design.md](design.md) §5.5），逐字节比只会得到假 FAIL。报告里会
+  标出"只比 status/trap"。
 - 最后打印 PASS/SKIP/FAIL 计数和每个 case 的 RTL 周期数、IPC；加 `--stats` 还能看
   发射 / 提交 / 重发 / 没发射 / LSU 排队的分解（IPC 曲线和"为什么只有 0.6"都从
   这里看）。
@@ -327,8 +328,8 @@ max_steps = 20480
 ### 自动比对
 
 `skein-case`（`make rtl-sim`）逐个跑 `cases/`：黄金模型在进程里跑，RTL 由 testbench
-跑完 dump 出状态快照（每个 warp 的 pc、GPR、谓词、`M` + case 声明的内存窗口），
-和黄金模型逐项比。不一致时打印寄存器号/lane/地址、期望值和实际值。
+跑完 dump 出状态快照（每个 warp 的 pc、GPR、谓词、`M`、出错时的 trap + case 声明的
+内存窗口），和黄金模型逐项比。不一致时打印寄存器号/lane/地址、期望值和实际值。
 
 ### 上板验证
 

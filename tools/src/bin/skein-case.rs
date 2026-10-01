@@ -4,8 +4,9 @@
 //! 比对逻辑都在这里。形状不支持的 case（block 比核还大、多 block）只跑黄金模型，报
 //! SKIP；形状由 `tb_core --print-shape` 自报，所以这里不写死 lane 数 / warp 数。
 //!
-//! 黄金模型报错（status != OK）时只比 status 和 pc：出错之后哪些 lane / 哪些存储已经
-//! 生效属于实现行为，不是架构契约（见 docs/design.md §5.5），逐字节比只会得到假 FAIL。
+//! 黄金模型报错（status != OK）时只比 status 和 trap（哪条 warp 停在哪个 PC）：出错
+//! 之后哪些 lane / 哪些存储已经生效属于实现行为，不是架构契约（见 docs/design.md
+//! §5.5），逐字节比只会得到假 FAIL。
 //!
 //! 用法见 `skein-case --help`；`make rtl-sim` 会先建好模型再调它。
 
@@ -58,10 +59,19 @@ struct Snapshot {
     #[serde(default)]
     cycles: u64,
     #[serde(default)]
+    fault: Option<SnapshotFault>,
+    #[serde(default)]
     perf: Perf,
     warps: Vec<SnapshotWarp>,
     #[serde(default)]
     mem: Vec<SnapshotWindow>,
+}
+
+/// RTL 的 trap（`SK_core.trap_*`）：正常结束是 null。
+#[derive(Deserialize, Debug)]
+struct SnapshotFault {
+    wid: u32,
+    pc: u32,
 }
 
 /// RTL 的性能计数器（`SK_perf`，见 docs/design.md §13）。
@@ -190,7 +200,7 @@ fn main() -> ExitCode {
                 limited,
             }) => {
                 passed += 1;
-                let note = if limited { "  只比 status/pc" } else { "" };
+                let note = if limited { "  只比 status/trap" } else { "" };
                 let stats = stats
                     .map(|line| format!("\n    {line}"))
                     .unwrap_or_default();
@@ -360,10 +370,9 @@ fn run(case: &Case, args: &Args, shape: Option<&RtlShape>) -> Result<Outcome, Ve
     }
 }
 
-/// RTL 的快照 vs 黄金模型：状态、每条 warp 的 pc/M/GPR/谓词，加上 case 声明的内存窗口。
-///
-/// 黄金模型报错时只比 status 和 pc——出错之后哪些 lane 已经提交、内存写进去多少都属于
-/// 实现行为（docs/design.md §5.5），不是架构契约；比下去只会得到假 FAIL。
+/// RTL 的快照 vs 黄金模型：正常结束时比每条 warp 的 pc/M/GPR/谓词和 case 声明的内存
+/// 窗口；黄金模型报错时只比 status 和 trap——出错之后哪些 lane 已经提交、内存写进去
+/// 多少都属于实现行为（docs/design.md §5.5），不是架构契约；比下去只会得到假 FAIL。
 fn compare(golden: &Machine, windows: &[Vec<u32>], rtl: &Snapshot) -> Vec<String> {
     let mut problems = Vec::new();
     let want_status = golden.status;
@@ -380,6 +389,33 @@ fn compare(golden: &Machine, windows: &[Vec<u32>], rtl: &Snapshot) -> Vec<String
         ));
     }
 
+    if golden.status != Status::Ok {
+        match (golden.fault, &rtl.fault) {
+            (Some((wid, pc)), Some(actual)) => {
+                if actual.wid as usize != wid || actual.pc as usize != pc {
+                    problems.push(format!(
+                        "trap 期望 w{wid} pc {pc}，实际 w{} pc {}",
+                        actual.wid, actual.pc
+                    ));
+                }
+            }
+            (Some((wid, pc)), None) => {
+                problems.push(format!("RTL 没报 trap，黄金模型停在 w{wid} pc {pc}"));
+            }
+            (None, Some(actual)) => {
+                problems.push(format!(
+                    "黄金模型没报 trap，RTL 停在 w{} pc {}",
+                    actual.wid, actual.pc
+                ));
+            }
+            (None, None) => {} // BAD_LAUNCH 之类：还没执行到任何指令
+        }
+        return problems;
+    }
+
+    if rtl.fault.is_some() {
+        problems.push("状态是 OK，但 RTL 报了 trap".to_string());
+    }
     if rtl.warps.len() < golden.warps.len() {
         problems.push(format!(
             "RTL 的 dump 里只有 {} 条 warp，黄金模型有 {} 条",
@@ -388,15 +424,12 @@ fn compare(golden: &Machine, windows: &[Vec<u32>], rtl: &Snapshot) -> Vec<String
         ));
         return problems;
     }
-    // 每条 warp 各比各的：pc 出错时是"停在哪儿"的信息，report 里留着
+    // 每条 warp 各比各的
     for (wid, want_warp) in golden.warps.iter().enumerate() {
         let warp = &rtl.warps[wid];
         if warp.pc as usize != want_warp.pc {
             problems.push(format!("w{wid} pc 期望 {}，实际 {}", want_warp.pc, warp.pc));
         }
-    }
-    if golden.status != Status::Ok {
-        return problems;
     }
     for (wid, want_warp) in golden.warps.iter().enumerate() {
         let warp = &rtl.warps[wid];

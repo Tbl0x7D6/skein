@@ -61,7 +61,7 @@ module SK_core #(
     // 调试扫描口（仿真用）：0x00-0x1F = (warp, lane) 选中的 GPR，0x20 = 该 warp 的 M，
     // 0x21 = 该 (warp, lane) 的谓词，0x22 = 架构 PC，0x23 = STATUS，0x24 = S4 阶段指令，
     // 0x25 = {done, 在跑}，0x26 = S4 阶段 PC，0x27 = 该 warp 的状态，
-    // 0x30-0x39 = 性能计数器（SK_perf）
+    // 0x29-0x2B = trap（出错停机时才有意义），0x30-0x39 = 性能计数器（SK_perf）
     input  logic [7:0]                        dbg_addr_i,
     input  logic [WARP_W-1:0]                 dbg_wid_i,
     input  logic [LANE_W-1:0]                 dbg_lane_i,
@@ -81,9 +81,13 @@ module SK_core #(
 
     // 每条 warp 的架构状态
     logic [15:0]          pc_q [NUM_WARPS];       // 取指 PC（发射时 +1，分支在执行级改）
-    logic [15:0]          pc_a_q [NUM_WARPS];     // 架构 PC（黄金模型的 pc）
     logic [NUM_LANES-1:0] m_q [NUM_WARPS];
     logic [NUM_PRED-1:0]  pred_q [NUM_WARPS][NUM_LANES];
+
+    // 出错停机时停在哪（错误路径的契约，docs/design.md §5.5）：正常结束 valid 为 0
+    logic              trap_valid_q;
+    logic [WARP_W-1:0] trap_wid_q;
+    logic [15:0]       trap_pc_q;
 
     // 启动参数：blockDim 是主机给的（P6 走 AXI-Lite），这里只做范围检查
     logic [31:0]       block_dim;
@@ -634,6 +638,7 @@ module SK_core #(
         if (!aresetn) begin
             state_q      <= S_IDLE;
             status_q     <= SK_STATUS_OK;
+            trap_valid_q <= 1'b0;
             warp_busy    <= '0;
             warp_wait    <= '0;
             f1_valid_q   <= 1'b0;
@@ -642,7 +647,6 @@ module SK_core #(
             exwb_valid_q <= 1'b0;
             for (int warp = 0; warp < NUM_WARPS; warp++) begin
                 pc_q[warp]   <= 16'd0;
-                pc_a_q[warp] <= 16'd0;
                 m_q[warp]    <= FULL_MASK;
                 for (int lane = 0; lane < NUM_LANES; lane++) begin
                     pred_q[warp][lane] <= '0;
@@ -652,6 +656,7 @@ module SK_core #(
             case (state_q)
                 S_IDLE: begin
                     if (start_i) begin
+                        trap_valid_q <= 1'b0;
                         // 调度器的"在途/等排空"标志也一起清：留下 stale 的 busy 位，
                         // 这条 warp 就因为 ready 要求 !busy 而永远发不出去（grid>1、
                         // 出错停机后重启都会踩到）。
@@ -669,7 +674,6 @@ module SK_core #(
                             exwb_valid_q <= 1'b0;
                             for (int warp = 0; warp < NUM_WARPS; warp++) begin
                                 pc_q[warp]   <= 16'd0;
-                                pc_a_q[warp] <= 16'd0;
                                 m_q[warp]    <= FULL_MASK;
                                 for (int lane = 0; lane < NUM_LANES; lane++) begin
                                     pred_q[warp][lane] <= '0;
@@ -682,17 +686,24 @@ module SK_core #(
                     if (stop_now) begin
                         status_q     <= stop_status;
                         state_q      <= S_DONE;
+                        // trap 是错误路径的契约：记下哪条 warp 停在哪个 PC。访存出错的
+                        // 那条指令没提交过，PC 记它的下一条；取指越界停在取不到的地址上
+                        // （黄金模型也是这个语义，见 docs/design.md §5.5）。
+                        trap_valid_q <= 1'b1;
+                        if (mem_fault) begin
+                            trap_wid_q <= lsu_fault_wid;
+                            trap_pc_q  <= lsu_fault_pc + 16'd1;
+                        end else if (fetch_oob) begin
+                            trap_wid_q <= ifid_wid_q;
+                            trap_pc_q  <= ifid_pc_q;
+                        end else begin
+                            trap_wid_q <= exwb_wid_q;
+                            trap_pc_q  <= exwb_npc_q;
+                        end
                         f1_valid_q   <= 1'b0;
                         ifid_valid_q <= 1'b0;
                         idex_valid_q <= 1'b0;
                         exwb_valid_q <= 1'b0;
-                        // 架构 PC 是契约的一部分：访存出错的那条指令没提交过，
-                        // 指令自己报错（BAD_INSN / BAR 不完整）的则按正常提交算。
-                        if (mem_fault) begin
-                            pc_a_q[lsu_fault_wid] <= lsu_fault_pc + 16'd1;
-                        end else if (commit_fault != SK_STATUS_OK) begin
-                            pc_a_q[exwb_wid_q] <= exwb_npc_q;
-                        end
                     end else begin
                         // S1 → 取指请求（下一拍给 BRAM 出地址）
                         f1_valid_q <= issue_valid;
@@ -763,13 +774,12 @@ module SK_core #(
                             end
                         end
 
-                        // S5 提交：写谓词、写 M，更新架构 PC（寄存器堆写口在组合逻辑里）
+                        // S5 提交：写谓词、写 M（寄存器堆写口在组合逻辑里）
                         if (exwb_valid_q) begin
                             if (exwb_fault_q != SK_STATUS_OK) begin
                                 status_q <= exwb_fault_q;
                                 state_q  <= S_DONE;
                             end else begin
-                                pc_a_q[exwb_wid_q] <= exwb_npc_q;
                                 for (int lane = 0; lane < NUM_LANES; lane++) begin
                                     if (exwb_pred_we_q[lane]) begin
                                         pred_q[exwb_wid_q][lane][exwb_rd_q[2:0]]
@@ -820,13 +830,16 @@ module SK_core #(
         unique case (dbg_addr_i)
             8'h20:   dbg_data_o = 32'(m_q[dbg_wid_i]);
             8'h21:   dbg_data_o = 32'(pred_q[dbg_wid_i][dbg_lane_i]);
-            8'h22:   dbg_data_o = {16'd0, pc_a_q[dbg_wid_i]};
+            8'h22:   dbg_data_o = {16'd0, pc_q[dbg_wid_i]};
             8'h23:   dbg_data_o = {28'd0, status_q};
             8'h24:   dbg_data_o = idex_insn_q;
             8'h25:   dbg_data_o = {30'd0, done_o, (state_q == S_RUN)};
             8'h26:   dbg_data_o = {16'd0, idex_pc_q};
             8'h27:   dbg_data_o = {30'd0, warp_state[dbg_wid_i]};
             8'h28:   dbg_data_o = {29'd0, idex_valid_q, idex_wid_q};
+            8'h29:   dbg_data_o = {31'd0, trap_valid_q};
+            8'h2A:   dbg_data_o = {30'd0, trap_wid_q};
+            8'h2B:   dbg_data_o = {16'd0, trap_pc_q};
             default: dbg_data_o = (dbg_addr_i >= 8'h30) ? perf_data
                                  : ((dbg_addr_i < 8'd32) ? gpr_dbg : 32'd0);
         endcase

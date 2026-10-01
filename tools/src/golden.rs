@@ -85,8 +85,13 @@ pub struct Machine {
     pub status: Status,
     pub steps: u64,
     pub barriers: u64,
+    /// 出错时停在哪：`(wid, pc)`。`STATUS` 和这个 PC 是错误路径的契约
+    /// （docs/design.md §5.5）；正常结束是 `None`。
+    pub fault: Option<(usize, usize)>,
     /// 各分类的指令条数（性能计数用，见 docs/design.md §13）。
     counts: Vec<u64>,
+    /// 当前正在执行哪条 warp 的哪条指令：fail 时用它抓"停下来的 PC"。
+    cur_wid: Option<usize>,
     /// 模拟器的死循环保护被触发（不是硬件状态）。
     pub limit_hit: bool,
     /// warpSize（`S_WARPSZ`）。
@@ -129,7 +134,9 @@ impl Machine {
             status: Status::Ok,
             steps: 0,
             barriers: 0,
+            fault: None,
             counts: vec![0; OpClass::ALL.len()],
+            cur_wid: None,
             limit_hit: false,
             warpsz: config.warpsz,
             nwarp: config.nwarp,
@@ -197,6 +204,8 @@ impl Machine {
     }
 
     pub fn run(&mut self) -> Status {
+        self.cur_wid = None;
+        self.fault = None;
         if let Some(status) = self.launch_error() {
             self.fail(status);
             return self.status;
@@ -253,6 +262,7 @@ impl Machine {
     }
 
     fn step(&mut self, wid: usize) {
+        self.cur_wid = Some(wid);
         if self.warps[wid].pc >= self.imem.len() {
             self.fail(Status::PcOob);
             return;
@@ -284,6 +294,9 @@ impl Machine {
 
     fn fail(&mut self, status: Status) {
         self.status = status;
+        // "停下来的 PC" = 这条 warp 现在的 pc：取指越界时不前进，其余错误是
+        // `pc += 1` 之后的值，两种都和契约一致（docs/design.md §5.5）。
+        self.fault = self.cur_wid.map(|wid| (wid, self.warps[wid].pc));
         for warp in &mut self.warps {
             warp.state = WarpState::Done;
         }
@@ -621,6 +634,11 @@ impl Machine {
         out.push_str("{\n");
         out.push_str(&format!("  \"status\": {},\n", self.status.code()));
         out.push_str(&format!("  \"status_name\": \"{}\",\n", self.status.text()));
+        out.push_str("  \"fault\": ");
+        match self.fault {
+            Some((wid, pc)) => out.push_str(&format!("{{\"wid\": {wid}, \"pc\": {pc}}},\n")),
+            None => out.push_str("null,\n"),
+        }
         out.push_str(&format!("  \"steps\": {},\n", self.steps));
         out.push_str(&format!("  \"barriers\": {},\n", self.barriers));
         out.push_str(&format!("  \"grid\": {},\n", self.grid));

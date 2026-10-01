@@ -46,12 +46,15 @@ constexpr uint32_t GMEM_BYTES = 1 << 20;
 // 调试扫描口（见 rtl/core/SK_core.sv）
 constexpr uint8_t DBG_M = 0x20;
 constexpr uint8_t DBG_PRED = 0x21;
-constexpr uint8_t DBG_PC_ARCH = 0x22;
+constexpr uint8_t DBG_PC_WARP = 0x22;
 constexpr uint8_t DBG_STATUS = 0x23;
 constexpr uint8_t DBG_INSN = 0x24;
 constexpr uint8_t DBG_RUN = 0x25;
 constexpr uint8_t DBG_PC_S4 = 0x26;
 constexpr uint8_t DBG_S4_WID = 0x28;
+constexpr uint8_t DBG_TRAP_VALID = 0x29;
+constexpr uint8_t DBG_TRAP_WID = 0x2A;
+constexpr uint8_t DBG_TRAP_PC = 0x2B;
 constexpr uint8_t DBG_PERF = 0x30;
 
 /// 性能计数器的下标（和 rtl/perf/SK_perf.sv 一致）。
@@ -298,10 +301,17 @@ bool apply_init(const MemInit& init, std::vector<uint32_t>& smem, std::vector<ui
     return true;
 }
 
-/// 状态 + 内存窗口写成 JSON（形状对齐 skein-run --dump-state，多一个 "perf"）。
+/// 出错停机时的 trap（`SK_core.trap_*`）：正常结束 valid 为 false。
+struct Trap {
+    bool valid = false;
+    uint32_t wid = 0;
+    uint32_t pc = 0;
+};
+
+/// 状态 + 内存窗口写成 JSON（形状对齐 skein-run --dump-state，多一个 "perf" 和 "fault"）。
 /// 每条 warp 的 `gpr[lane][reg]`、`pred[lane]` 是每 lane 一份，`m` 是 N 位执行 mask。
 bool write_state(const Options& opt, const Shape& shape, uint32_t status, long cycles,
-                 const std::vector<WarpState>& warps, const uint32_t* perf,
+                 const std::vector<WarpState>& warps, const uint32_t* perf, const Trap& trap,
                  const std::vector<uint32_t>& smem, const std::vector<uint32_t>& gmem) {
     std::ofstream out(opt.state);
     if (!out) {
@@ -311,6 +321,12 @@ bool write_state(const Options& opt, const Shape& shape, uint32_t status, long c
     out << "{\n";
     out << "  \"status\": " << status << ",\n";
     out << "  \"cycles\": " << cycles << ",\n";
+    out << "  \"fault\": ";
+    if (trap.valid) {
+        out << "{\"wid\": " << trap.wid << ", \"pc\": " << trap.pc << "},\n";
+    } else {
+        out << "null,\n";
+    }
     out << "  \"warpsz\": " << shape.warpsz << ",\n";
     out << "  \"nwarp\": " << shape.nwarp << ",\n";
     out << "  \"perf\": {";
@@ -546,7 +562,7 @@ int main(int argc, char** argv) {
         WarpState warp;
         warp.wid = wid;
         dut->dbg_wid_i = wid;
-        warp.pc = dbg(DBG_PC_ARCH);
+        warp.pc = dbg(DBG_PC_WARP);
         warp.m = dbg(DBG_M);
         for (uint32_t lane = 0; lane < shape.warpsz; lane++) {
             dut->dbg_lane_i = lane;
@@ -566,9 +582,13 @@ int main(int argc, char** argv) {
         perf[i] = dbg((uint8_t)(DBG_PERF + i));
     }
     uint32_t status = dbg(DBG_STATUS);
+    Trap trap;
+    trap.valid = dbg(DBG_TRAP_VALID) != 0;
+    trap.wid = dbg(DBG_TRAP_WID);
+    trap.pc = dbg(DBG_TRAP_PC);
 
     if (!opt.state.empty()) {
-        if (!write_state(opt, shape, status, cycles, warps, perf, smem, gmem)) {
+        if (!write_state(opt, shape, status, cycles, warps, perf, trap, smem, gmem)) {
             return 2;
         }
     }
