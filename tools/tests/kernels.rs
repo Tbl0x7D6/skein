@@ -193,17 +193,65 @@ fn check_matmul(case: &Case, machine: &Machine) {
 }
 
 fn matmul_reference(rows: usize, a: &[i32], b: &[i32]) -> Vec<i32> {
-    let mut c = vec![0i32; rows * MATMUL_N];
+    matmul_reference_n(rows, MATMUL_N, a, b)
+}
+
+/// 通用 rows × n 的整数矩阵乘参考（A: rows×n，B: n×n）。
+fn matmul_reference_n(rows: usize, n: usize, a: &[i32], b: &[i32]) -> Vec<i32> {
+    let mut c = vec![0i32; rows * n];
     for i in 0..rows {
-        for j in 0..MATMUL_N {
+        for j in 0..n {
             let mut acc = 0i32;
-            for k in 0..MATMUL_N {
-                acc = acc.wrapping_add(a[i * MATMUL_N + k].wrapping_mul(b[k * MATMUL_N + j]));
+            for k in 0..n {
+                acc = acc.wrapping_add(a[i * n + k].wrapping_mul(b[k * n + j]));
             }
-            c[i * MATMUL_N + j] = acc;
+            c[i * n + j] = acc;
         }
     }
     c
+}
+
+#[test]
+fn vecadd_stream_matches_reference() {
+    // M5 的 streaming 用例：n = 1024，访存全是连续 lane，事务数应该被合并器压到最低
+    let (case, machine) = run_case("bench/vecadd_stream/vecadd_stream");
+    assert_eq!(machine.status, Status::Ok);
+    let n = sreg_of(&case, "ARG0") as usize;
+    let (a, b) = (
+        gmem(&machine, sreg_of(&case, "PTR_A"), n),
+        gmem(&machine, sreg_of(&case, "PTR_B"), n),
+    );
+    let c = gmem(&machine, sreg_of(&case, "PTR_C"), n);
+    for i in 0..n {
+        assert_eq!(c[i], a[i].wrapping_add(b[i]), "i = {i}");
+    }
+}
+
+#[test]
+fn sgemm64_matches_reference() {
+    // M5 的 sgemm：int32 64×64（A 转置进 shared，B 广播），逐元素和 Rust 参考比
+    const N: usize = 64;
+    let (case, machine) = run_case("bench/sgemm64/sgemm64");
+    assert_eq!(machine.status, Status::Ok);
+    let a: Vec<i32> = gmem(&machine, sreg_of(&case, "PTR_A"), N * N)
+        .iter()
+        .map(|value| *value as i32)
+        .collect();
+    let b: Vec<i32> = gmem(&machine, sreg_of(&case, "PTR_B"), N * N)
+        .iter()
+        .map(|value| *value as i32)
+        .collect();
+    let c = gmem(&machine, sreg_of(&case, "PTR_C"), N * N);
+    let expect = matmul_reference_n(N, N, &a, &b);
+    for index in 0..N * N {
+        assert_eq!(
+            c[index] as i32,
+            expect[index],
+            "第 {} 行第 {} 列",
+            index / N,
+            index % N
+        );
+    }
 }
 
 #[test]

@@ -1,14 +1,18 @@
-//! SK_core 的 Verilator testbench：喂输入、跑到底、dump 状态。
+//! Verilator testbench（顶层是 tb_top：SK_core + AXI 从机内存模型）。
 //!
 //! 这里不做比对——`skein-case`（tools/src/bin/skein-case.rs）把这份 dump 和黄金模型逐项
 //! 比对。testbench 只负责：装载 IMEM 镜像和 shared/global 初态、驱动特殊寄存器、
-//! 跑到 done 或者报错，然后按 --mem-window 把架构状态和内存窗口写成 JSON，
-//! 字段和 `skein-run --dump-state` 对齐（多一个 "mem" 和 "perf"）。
+//! 跑到 done 或者报错，然后按 --mem-window 把架构状态、性能计数器和内存窗口写成 JSON，
+//! 字段和 `skein-run --dump-state` 对齐（多一个 "mem"、"perf" 和 "fault"）。
+//!
+//! global memory 走核的 AXI4 主口，由 tb_axi_mem.sv 应答；主机侧通过它的 host 口
+//! 装初态、读回比对窗口。shared memory 在核内，通过核的主机口装初态 / 读快照。
 //!
 //! 用法：
 //!   tb_core --image <image.bin> [--bdim N] [--nwarp N] [--set NAME=VALUE]...
 //!           [--gmem-init ADDR FILE]... [--smem-init ADDR FILE]...
 //!           [--mem-window SPACE ADDR WORDS]... [--max-cycles N] [--trace]
+//!           [--axi-rd-latency N] [--axi-wr-latency N]
 //!           [--dump-state <file>] [--dump-wave <file.fst>]
 //!   tb_core --print-shape                      # 只打印核的形状，不跑
 //!
@@ -31,7 +35,7 @@
 #include <string>
 #include <vector>
 
-#include "VSK_core.h"
+#include "Vtb_top.h"
 #include "verilated.h"
 #if VM_TRACE
 #include "verilated_fst_c.h"
@@ -56,6 +60,7 @@ constexpr uint8_t DBG_TRAP_VALID = 0x29;
 constexpr uint8_t DBG_TRAP_WID = 0x2A;
 constexpr uint8_t DBG_TRAP_PC = 0x2B;
 constexpr uint8_t DBG_PERF = 0x30;
+constexpr uint8_t DBG_CLASS = 0x44;
 
 /// 性能计数器的下标（和 rtl/perf/SK_perf.sv 一致）。
 constexpr int PERF_CYCLE = 0;
@@ -65,7 +70,21 @@ constexpr int PERF_REPLAY = 3;
 constexpr int PERF_BARRIER = 4;
 constexpr int PERF_STALL_NO_WARP = 5;
 constexpr int PERF_LSU_BUSY = 6;
-constexpr int NUM_PERF = 7;
+constexpr int PERF_LDS_TXN = 7;
+constexpr int PERF_STS_TXN = 8;
+constexpr int PERF_LDS_REPLAY = 9;
+constexpr int PERF_AXI_RD_TXN = 10;
+constexpr int PERF_AXI_WR_TXN = 11;
+constexpr int PERF_AXI_RD_BEATS = 12;
+constexpr int PERF_AXI_WR_BEATS = 13;
+constexpr int PERF_AXI_STALL = 14;
+constexpr int PERF_L1_RD_HIT = 15;
+constexpr int PERF_L1_RD_MISS = 16;
+constexpr int PERF_L1_WR_HIT = 17;
+constexpr int PERF_L1_WR_MISS = 18;
+constexpr int PERF_L1_WB = 19;
+constexpr int NUM_PERF = 20;
+constexpr int NUM_CLASS = 15;
 
 // 特殊寄存器编号，和 tools/src/isa.rs 的 Sreg 一致
 constexpr int SREG_TID = 0x00;
@@ -134,6 +153,8 @@ struct Options {
     long max_cycles = 200000;
     long bdim = 0;              // 0 = 用满容量
     long nwarp = 0;             // 0 = 报硬件容量
+    long axi_rd_latency = 2;
+    long axi_wr_latency = 2;
     bool trace = false;
     bool print_shape = false;
 };
@@ -142,6 +163,7 @@ void usage() {
     std::cerr << "用法：tb_core --image <image.bin> [--bdim N] [--nwarp N] [--set NAME=VALUE]... "
                  "[--gmem-init ADDR FILE]... [--smem-init ADDR FILE]... "
                  "[--mem-window SPACE ADDR WORDS]... [--max-cycles N] [--trace] "
+                 "[--axi-rd-latency N] [--axi-wr-latency N] "
                  "[--dump-state <file>] [--dump-wave <file.fst>]\n"
                  "       tb_core --print-shape\n";
 }
@@ -236,6 +258,12 @@ bool parse_args(int argc, char** argv, Options& opt) {
         } else if (arg == "--nwarp") {
             if (!need(1)) return false;
             opt.nwarp = strtol(argv[++i], nullptr, 0);
+        } else if (arg == "--axi-rd-latency") {
+            if (!need(1)) return false;
+            opt.axi_rd_latency = strtol(argv[++i], nullptr, 0);
+        } else if (arg == "--axi-wr-latency") {
+            if (!need(1)) return false;
+            opt.axi_wr_latency = strtol(argv[++i], nullptr, 0);
         } else if (arg == "--trace") {
             opt.trace = true;
         } else if (arg == "--print-shape") {
@@ -262,7 +290,7 @@ bool parse_args(int argc, char** argv, Options& opt) {
     return true;
 }
 
-/// IMEM 镜像：每字 32 位小端。
+/// 镜像/初态文件：每字 32 位小端。
 bool load_words(const std::string& path, std::vector<uint32_t>& words) {
     std::ifstream file(path, std::ios::binary);
     if (!file) {
@@ -282,25 +310,6 @@ bool load_words(const std::string& path, std::vector<uint32_t>& words) {
     return true;
 }
 
-/// 把初态文件写进内存模型；越界或者没对齐直接报错。
-bool apply_init(const MemInit& init, std::vector<uint32_t>& smem, std::vector<uint32_t>& gmem) {
-    std::vector<uint32_t> words;
-    if (!load_words(init.file, words)) {
-        return false;
-    }
-    std::vector<uint32_t>& memory = init.smem ? smem : gmem;
-    uint32_t bytes = (uint32_t)(memory.size() * 4);
-    if (init.addr % 4 != 0 || init.addr + words.size() * 4 > bytes) {
-        std::cerr << init.file << ": 初态写到 0x" << std::hex << init.addr << std::dec
-                  << " 越界或者没对齐\n";
-        return false;
-    }
-    for (size_t i = 0; i < words.size(); i++) {
-        memory[init.addr / 4 + i] = words[i];
-    }
-    return true;
-}
-
 /// 出错停机时的 trap（`SK_core.trap_*`）：正常结束 valid 为 false。
 struct Trap {
     bool valid = false;
@@ -308,11 +317,12 @@ struct Trap {
     uint32_t pc = 0;
 };
 
-/// 状态 + 内存窗口写成 JSON（形状对齐 skein-run --dump-state，多一个 "perf" 和 "fault"）。
-/// 每条 warp 的 `gpr[lane][reg]`、`pred[lane]` 是每 lane 一份，`m` 是 N 位执行 mask。
+/// 状态 + 性能计数器 + 内存窗口写成 JSON（形状对齐 skein-run --dump-state）。
+/// `windows` 是已经读好的各窗口数据，顺序和 `opt.windows` 一致。
 bool write_state(const Options& opt, const Shape& shape, uint32_t status, long cycles,
-                 const std::vector<WarpState>& warps, const uint32_t* perf, const Trap& trap,
-                 const std::vector<uint32_t>& smem, const std::vector<uint32_t>& gmem) {
+                 const std::vector<WarpState>& warps, const uint32_t* perf,
+                 const uint32_t* class_cnt, const Trap& trap,
+                 const std::vector<std::vector<uint32_t>>& windows) {
     std::ofstream out(opt.state);
     if (!out) {
         std::cerr << "写不了 " << opt.state << "\n";
@@ -336,7 +346,25 @@ bool write_state(const Options& opt, const Shape& shape, uint32_t status, long c
         << ", \"replay\": " << perf[PERF_REPLAY]
         << ", \"barriers\": " << perf[PERF_BARRIER]
         << ", \"stall_no_warp\": " << perf[PERF_STALL_NO_WARP]
-        << ", \"lsu_busy\": " << perf[PERF_LSU_BUSY] << "},\n";
+        << ", \"lsu_busy\": " << perf[PERF_LSU_BUSY]
+        << ", \"lds_txn\": " << perf[PERF_LDS_TXN]
+        << ", \"sts_txn\": " << perf[PERF_STS_TXN]
+        << ", \"lds_replay\": " << perf[PERF_LDS_REPLAY]
+        << ", \"axi_rd_txn\": " << perf[PERF_AXI_RD_TXN]
+        << ", \"axi_wr_txn\": " << perf[PERF_AXI_WR_TXN]
+        << ", \"axi_rd_beats\": " << perf[PERF_AXI_RD_BEATS]
+        << ", \"axi_wr_beats\": " << perf[PERF_AXI_WR_BEATS]
+        << ", \"axi_stall\": " << perf[PERF_AXI_STALL]
+        << ", \"l1_rd_hit\": " << perf[PERF_L1_RD_HIT]
+        << ", \"l1_rd_miss\": " << perf[PERF_L1_RD_MISS]
+        << ", \"l1_wr_hit\": " << perf[PERF_L1_WR_HIT]
+        << ", \"l1_wr_miss\": " << perf[PERF_L1_WR_MISS]
+        << ", \"l1_wb\": " << perf[PERF_L1_WB];
+    out << ", \"class\": [";
+    for (int i = 0; i < NUM_CLASS; i++) {
+        out << (i ? ", " : "") << class_cnt[i];
+    }
+    out << "]},\n";
     out << "  \"warps\": [\n";
     for (size_t index = 0; index < warps.size(); index++) {
         const WarpState& warp = warps[index];
@@ -362,13 +390,13 @@ bool write_state(const Options& opt, const Shape& shape, uint32_t status, long c
     }
     out << "  ],\n";
     out << "  \"mem\": [\n";
-    for (size_t index = 0; index < opt.windows.size(); index++) {
+    for (size_t index = 0; index < windows.size(); index++) {
         const MemWindow& window = opt.windows[index];
-        const std::vector<uint32_t>& memory = window.smem ? smem : gmem;
         out << "    {\"space\": \"" << (window.smem ? "smem" : "gmem") << "\", \"addr\": "
             << window.addr << ", \"words\": [";
         for (uint32_t offset = 0; offset < window.words; offset++) {
-            out << (offset ? ", " : "") << memory[window.addr / 4 + offset];
+            uint32_t word = windows[index][offset];
+            out << (offset ? ", " : "") << word;
         }
         out << "]}" << (index + 1 == opt.windows.size() ? "" : ",") << "\n";
     }
@@ -386,9 +414,9 @@ int main(int argc, char** argv) {
 
     VerilatedContext context;
     context.commandArgs(argc, argv);
-    VSK_core* dut = new VSK_core{&context};
+    Vtb_top* dut = new Vtb_top{&context};
 
-    // 复位状态 + 特殊寄存器：形状来自核自己（shape_o），不在这里再写一份常量
+    // 复位状态 + 特殊寄存器
     dut->clk = 0;
     dut->aresetn = 0;
     dut->start_i = 0;
@@ -398,6 +426,24 @@ int main(int argc, char** argv) {
     dut->dbg_addr_i = 0;
     dut->dbg_wid_i = 0;
     dut->dbg_lane_i = 0;
+    dut->smem_ld_we_i = 0;
+    dut->smem_ld_addr_i = 0;
+    dut->smem_ld_wdata_i = 0;
+    dut->smem_rd_addr_i = 0;
+    dut->smem_rd_en_i = 0;
+    dut->host_we_i = 0;
+    dut->host_addr_i = 0;
+    dut->host_wdata_i = 0;
+    dut->host_raddr_i = 0;
+    // 端口是 8 bit：夹到量程内，别让 CLI 的越界值静默截断（P5 用过 4 bit 端口，
+    // --axi-latency 20 被截成 4，M5 的"延迟 20 拍"名不副实）
+    auto clamp_latency = [](long value) -> uint32_t {
+        if (value < 0) return 0;
+        if (value > 255) return 255;
+        return static_cast<uint32_t>(value);
+    };
+    dut->rd_lat_i = clamp_latency(opt.axi_rd_latency);
+    dut->wr_lat_i = clamp_latency(opt.axi_wr_latency);
     for (int i = 0; i < 16; i++) {
         dut->sreg_i[i] = 0;
     }
@@ -435,31 +481,40 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    std::vector<uint32_t> smem(SMEM_BYTES / 4, 0);
-    std::vector<uint32_t> gmem(GMEM_BYTES / 4, 0);
+    // shared / global 初态都通过各自的主机口写进硬件
+    std::vector<std::pair<uint32_t, uint32_t>> smem_init;
+    std::vector<std::pair<uint32_t, uint32_t>> gmem_init;
     for (const MemInit& init : opt.inits) {
-        if (!apply_init(init, smem, gmem)) {
+        std::vector<uint32_t> words;
+        if (!load_words(init.file, words)) {
             return 2;
+        }
+        if (init.smem) {
+            if (init.addr % 4 != 0 || init.addr + words.size() * 4 > SMEM_BYTES) {
+                std::cerr << init.file << ": shared 初态越界或者没对齐\n";
+                return 2;
+            }
+            for (size_t i = 0; i < words.size(); i++) {
+                smem_init.emplace_back(init.addr + (uint32_t)i * 4, words[i]);
+            }
+        } else {
+            if (init.addr % 4 != 0 || init.addr + words.size() * 4 > GMEM_BYTES) {
+                std::cerr << init.file << ": global 初态越界或者没对齐\n";
+                return 2;
+            }
+            for (size_t i = 0; i < words.size(); i++) {
+                gmem_init.emplace_back(init.addr + (uint32_t)i * 4, words[i]);
+            }
         }
     }
     for (const MemWindow& window : opt.windows) {
-        const std::vector<uint32_t>& memory = window.smem ? smem : gmem;
-        if (window.addr % 4 != 0
-            || window.addr / 4 + window.words > (uint32_t)(memory.size())) {
+        uint32_t bytes = window.smem ? SMEM_BYTES : GMEM_BYTES;
+        if (window.addr % 4 != 0 || window.addr / 4 + window.words > bytes / 4) {
             std::cerr << "比对窗口 0x" << std::hex << window.addr << std::dec
                       << " 越界或者没对齐\n";
             return 2;
         }
     }
-
-    auto drive_memory = [&]() {
-        uint32_t sa = dut->smem_addr_o;
-        dut->smem_rdata_i = (sa <= SMEM_BYTES - 4) ? smem[sa >> 2] : 0;
-        dut->smem_fault_i = (sa > SMEM_BYTES - 4);
-        uint32_t ga = dut->gmem_addr_o;
-        dut->gmem_rdata_i = (ga <= GMEM_BYTES - 4) ? gmem[ga >> 2] : 0;
-        dut->gmem_fault_i = (ga > GMEM_BYTES - 4);
-    };
 
     // 波形：只有 trace 版模型（make tb-trace）才有，每个半周期 dump 一次
 #if VM_TRACE
@@ -484,22 +539,11 @@ int main(int argc, char** argv) {
     auto low_phase = [&]() {
         dut->clk = 0;
         dut->eval();
-        drive_memory();
-        dut->eval();
         dump_wave();
     };
     auto clock_edge = [&]() {
-        bool smem_we = dut->smem_we_o, gmem_we = dut->gmem_we_o;
-        uint32_t sa = dut->smem_addr_o, ga = dut->gmem_addr_o;
-        uint32_t sd = dut->smem_wdata_o, gd = dut->gmem_wdata_o;
         dut->clk = 1;
         dut->eval();
-        if (smem_we && sa <= SMEM_BYTES - 4) {
-            smem[sa >> 2] = sd;
-        }
-        if (gmem_we && ga <= GMEM_BYTES - 4) {
-            gmem[ga >> 2] = gd;
-        }
         dump_wave();
     };
     auto tick = [&]() {
@@ -525,6 +569,24 @@ int main(int argc, char** argv) {
         tick();
     }
     dut->imem_we_i = 0;
+
+    // shared 初态：核的主机口（写当拍生效，tick 一拍）
+    for (const auto& [addr, word] : smem_init) {
+        dut->smem_ld_we_i = 1;
+        dut->smem_ld_addr_i = (addr & 0x7FFFu) >> 2;
+        dut->smem_ld_wdata_i = word;
+        tick();
+        dut->smem_ld_we_i = 0;
+    }
+
+    // global 初态：AXI 从机的 host 口
+    for (const auto& [addr, word] : gmem_init) {
+        dut->host_we_i = 1;
+        dut->host_addr_i = addr;
+        dut->host_wdata_i = word;
+        tick();
+        dut->host_we_i = 0;
+    }
     dut->aresetn = 1;
 
     // 启动
@@ -581,6 +643,10 @@ int main(int argc, char** argv) {
     for (int i = 0; i < NUM_PERF; i++) {
         perf[i] = dbg((uint8_t)(DBG_PERF + i));
     }
+    uint32_t class_cnt[NUM_CLASS] = {};
+    for (int i = 0; i < NUM_CLASS; i++) {
+        class_cnt[i] = dbg((uint8_t)(DBG_CLASS + i));
+    }
     uint32_t status = dbg(DBG_STATUS);
     Trap trap;
     trap.valid = dbg(DBG_TRAP_VALID) != 0;
@@ -588,7 +654,29 @@ int main(int argc, char** argv) {
     trap.pc = dbg(DBG_TRAP_PC);
 
     if (!opt.state.empty()) {
-        if (!write_state(opt, shape, status, cycles, warps, perf, trap, smem, gmem)) {
+        // 读比对窗口：global 走 AXI 从机的 host 口（组合读），
+        // shared 走核的主机口（同步读，给地址后 tick 一拍）
+        std::vector<std::vector<uint32_t>> windows_data;
+        for (const MemWindow& window : opt.windows) {
+            std::vector<uint32_t> words;
+            for (uint32_t offset = 0; offset < window.words; offset++) {
+                uint32_t addr = window.addr + offset * 4;
+                if (window.smem) {
+                    dut->smem_rd_addr_i = (addr & 0x7FFFu) >> 2;
+                    dut->smem_rd_en_i = 1;
+                    tick();
+                    words.push_back(dut->smem_rd_data_o);
+                    dut->smem_rd_en_i = 0;
+                } else {
+                    dut->host_raddr_i = addr;
+                    dut->eval();
+                    words.push_back(dut->host_rdata_o);
+                }
+            }
+            windows_data.push_back(words);
+        }
+        if (!write_state(opt, shape, status, cycles, warps, perf, class_cnt, trap,
+                         windows_data)) {
             return 2;
         }
     }

@@ -18,7 +18,7 @@ use serde::Deserialize;
 
 use skein::case::{Case, RtlShape};
 use skein::golden::Machine;
-use skein::isa::Status;
+use skein::isa::{OpClass, Status};
 
 /// 一个 case 最多列几条差异，剩下的只报数量
 const MAX_PROBLEMS: usize = 10;
@@ -50,6 +50,10 @@ struct Args {
     /// 每个 case 多打一行性能计数器（IPC 的分解，M3 的曲线从这儿拿数据）
     #[arg(long)]
     stats: bool,
+
+    /// AXI 从机的固定延迟（拍），两个方向同值；M5 对比表用 20
+    #[arg(long, value_name = "N")]
+    axi_latency: Option<u32>,
 }
 
 /// `tb_core --dump-state` 写出来的状态快照。
@@ -91,6 +95,34 @@ struct Perf {
     stall_no_warp: u64,
     #[serde(default)]
     lsu_busy: u64,
+    #[serde(default)]
+    lds_txn: u64,
+    #[serde(default)]
+    sts_txn: u64,
+    #[serde(default)]
+    lds_replay: u64,
+    #[serde(default)]
+    axi_rd_txn: u64,
+    #[serde(default)]
+    axi_wr_txn: u64,
+    #[serde(default)]
+    axi_rd_beats: u64,
+    #[serde(default)]
+    axi_wr_beats: u64,
+    #[serde(default)]
+    axi_stall: u64,
+    #[serde(default)]
+    l1_rd_hit: u64,
+    #[serde(default)]
+    l1_rd_miss: u64,
+    #[serde(default)]
+    l1_wr_hit: u64,
+    #[serde(default)]
+    l1_wr_miss: u64,
+    #[serde(default)]
+    l1_wb: u64,
+    #[serde(default)]
+    class: Vec<u64>,
 }
 
 impl Perf {
@@ -308,6 +340,13 @@ fn run(case: &Case, args: &Args, shape: Option<&RtlShape>) -> Result<Outcome, Ve
     if let Some(wave) = &args.wave {
         command.arg("--dump-wave").arg(wave);
     }
+    if let Some(latency) = args.axi_latency {
+        command
+            .arg("--axi-rd-latency")
+            .arg(latency.to_string())
+            .arg("--axi-wr-latency")
+            .arg(latency.to_string());
+    }
     let output = command
         .output()
         .map_err(|err| vec![format!("调用 {} 失败：{err}", tb.display())])?;
@@ -345,17 +384,49 @@ fn run(case: &Case, args: &Args, shape: Option<&RtlShape>) -> Result<Outcome, Ve
                 snapshot.perf.barriers, machine.barriers
             ));
         }
+        // 按指令类对拍：黄金模型的 op_counts 是对照组（和总数一样，属于语义检查）
+        let mut want_class = vec![0u64; OpClass::ALL.len()];
+        for (class, count) in machine.op_counts() {
+            want_class[class.code() as usize] = count;
+        }
+        for (index, want) in want_class.iter().enumerate() {
+            let actual = snapshot.perf.class.get(index).copied().unwrap_or(0);
+            if actual != *want {
+                problems.push(format!(
+                    "RTL 提交 {} 条 {}，黄金模型 {} 条",
+                    actual,
+                    OpClass::ALL[index].text(),
+                    want
+                ));
+            }
+        }
     }
     if problems.is_empty() {
         let stats = args.stats.then(|| {
             format!(
-                "issued={} retired={} replay={} no_issue={} no_warp={} lsu_busy={}",
+                "issued={} retired={} replay={} no_issue={} no_warp={} lsu_busy={}\n    \
+                 lds={} sts={} lds_replay={} l1(hit/miss/wb)={}/{}/{} wr={}/{}\n    \
+                 axi(rd/wr txn)={}/{} beats={}/{} bytes={} stall={}",
                 snapshot.perf.issued,
                 snapshot.perf.retired,
                 snapshot.perf.replay,
                 snapshot.perf.no_issue(),
                 snapshot.perf.stall_no_warp,
                 snapshot.perf.lsu_busy,
+                snapshot.perf.lds_txn,
+                snapshot.perf.sts_txn,
+                snapshot.perf.lds_replay,
+                snapshot.perf.l1_rd_hit,
+                snapshot.perf.l1_rd_miss + snapshot.perf.l1_wr_miss,
+                snapshot.perf.l1_wb,
+                snapshot.perf.l1_wr_hit,
+                snapshot.perf.l1_wr_miss,
+                snapshot.perf.axi_rd_txn,
+                snapshot.perf.axi_wr_txn,
+                snapshot.perf.axi_rd_beats,
+                snapshot.perf.axi_wr_beats,
+                (snapshot.perf.axi_rd_beats + snapshot.perf.axi_wr_beats) * 8,
+                snapshot.perf.axi_stall,
             )
         });
         Ok(Outcome::Pass {

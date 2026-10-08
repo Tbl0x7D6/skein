@@ -35,6 +35,8 @@ pub struct Spec {
     pub grid: u32,
     /// 黄金模型的执行步数上限
     pub max_steps: Option<u64>,
+    /// RTL 的时钟上限（默认 testbench 自己的 200000，bench 用例要放大）
+    pub max_cycles: Option<u64>,
     /// 主机写的特殊寄存器（PTR_A/PTR_B/PTR_C/ARG0/ARG1/ARG2）
     #[serde(default)]
     pub sreg: BTreeMap<String, u32>,
@@ -341,6 +343,10 @@ impl Case {
         args.push(format!("{}", self.block_dim()));
         args.push("--nwarp".to_string());
         args.push(format!("{}", self.spec.nwarp));
+        if let Some(cycles) = self.spec.max_cycles {
+            args.push("--max-cycles".to_string());
+            args.push(format!("{cycles}"));
+        }
         let mut sregs: Vec<(&String, &u32)> = self.spec.sreg.iter().collect();
         sregs.sort();
         for (name, value) in sregs {
@@ -493,6 +499,15 @@ fn generate(name: &str, args: &BTreeMap<String, i64>) -> Result<Vec<u32>, String
         "matmul_b" => {
             let n = MATMUL_N;
             Ok((0..n * n).map(|i| ((i % 5) as i32 - 2) as u32).collect())
+        }
+        // M5 的 bench 用：和 matmul_a/b 同样的数，但大小由参数给
+        "matmul64_a" => {
+            let n = count("n")?;
+            Ok((0..n).map(|i| ((i % 7) as i32 - 3) as u32).collect())
+        }
+        "matmul64_b" => {
+            let n = count("n")?;
+            Ok((0..n).map(|i| ((i % 5) as i32 - 2) as u32).collect())
         }
         other => Err(format!("不认识的生成器：{other}")),
     }

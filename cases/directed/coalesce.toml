@@ -1,0 +1,33 @@
+# 定向：global 访存合并（同 line 多 lane / 同 word 冲突写 / 跨 line）
+program = "coalesce.s"
+warpsz = 4
+nwarp = 1
+block_dim = 4
+
+[sreg]
+PTR_A = 0x1000
+PTR_B = 0x2000
+PTR_C = 0x3000
+
+[[init]]
+space = "gmem"
+addr = 0x1000
+words = [11, 22, 33, 44, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xA0, 0xB0, 0xB1, 0xB2, 0]
+
+[[check]]
+space = "gmem"
+addr = 0x3000
+words = 4
+
+[[check]]
+space = "gmem"
+addr = 0x303C
+words = 4
+
+[[check]]
+space = "gmem"
+addr = 0x4000
+words = 1
+
+[expect]
+status = "OK"

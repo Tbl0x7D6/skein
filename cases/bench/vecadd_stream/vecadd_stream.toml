@@ -1,0 +1,33 @@
+# M5：streaming vecadd（n = 1024，16 线程，全部访存都是连续 lane）
+program = "../../kernels/vecadd/vecadd.s"
+warpsz = 4
+nwarp = 4
+block_dim = 16
+max_steps = 200000
+max_cycles = 200000
+
+[sreg]
+PTR_A = 0x1000
+PTR_B = 0x8000
+PTR_C = 0x10000
+ARG0 = 1024
+
+[[init]]
+space = "gmem"
+addr = 0x1000
+gen = "vecadd_a"
+args = { n = 1024 }
+
+[[init]]
+space = "gmem"
+addr = 0x8000
+gen = "vecadd_b"
+args = { n = 1024 }
+
+[[check]]
+space = "gmem"
+addr = 0x10000
+words = 1024
+
+[expect]
+status = "OK"

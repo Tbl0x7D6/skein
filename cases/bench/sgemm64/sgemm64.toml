@@ -1,0 +1,33 @@
+# M5：int32 sgemm 64×64（4 warp × 4 lane；A 转置进 shared，结果写回 global）
+program = "sgemm64.s"
+warpsz = 4
+nwarp = 4
+block_dim = 16
+max_steps = 2000000
+max_cycles = 3000000
+
+[sreg]
+PTR_A = 0x1000
+PTR_B = 0x6000
+PTR_C = 0x10000
+
+[[init]]
+space = "gmem"
+addr = 0x1000
+gen = "matmul64_a"
+args = { n = 4096 }
+
+[[init]]
+space = "gmem"
+addr = 0x6000
+gen = "matmul64_b"
+args = { n = 4096 }
+
+[[check]]
+space = "gmem"
+addr = 0x10000
+words = 4096
+
+[expect]
+status = "OK"
+barriers = 1

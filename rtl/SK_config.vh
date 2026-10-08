@@ -31,4 +31,21 @@
 `define SK_MEM_ADDR_W   32     // global 地址宽度
 `endif
 
+// --- P5 内存层次 ---
+`ifndef SK_GMEM_KB
+`define SK_GMEM_KB       1024   // 核认为的 global 容量（仿真 1 MB；P6 按实际 DDR 容量改）
+`endif
+`ifndef SK_COALESCE
+`define SK_COALESCE     1      // 1 = 按 64 B 行合并同 warp 的访存；0 = 每 lane 一笔（M5 基线）
+`endif
+`ifndef SK_L1
+`define SK_L1           1      // 1 = global 走 L1；0 = coalescer 直连 AXI（M5 对照）
+`endif
+`ifndef SK_MEM_LINE_BYTES
+`define SK_MEM_LINE_BYTES 64   // cache line / coalescer 合并粒度
+`endif
+`ifndef SK_AXI_DATA_W
+`define SK_AXI_DATA_W   64     // AXI4 数据宽度（bit）
+`endif
+
 `endif

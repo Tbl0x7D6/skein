@@ -60,6 +60,15 @@ package SK_pkg;
         SK_STATUS_BAD_LAUNCH     = 4'd7
     } sk_status_e;
 
+    /// 指令分类（和 tools/src/isa.rs 的 OpClass 同码），按类 retired 计数用。
+    typedef enum logic [3:0] {
+        SK_CLASS_ALU    = 4'd0,  SK_CLASS_CMP   = 4'd1,  SK_CLASS_SEL   = 4'd2,
+        SK_CLASS_IMM    = 4'd3,  SK_CLASS_LDS   = 4'd4,  SK_CLASS_STS   = 4'd5,
+        SK_CLASS_LDG    = 4'd6,  SK_CLASS_STG   = 4'd7,  SK_CLASS_MASK  = 4'd8,
+        SK_CLASS_BRANCH = 4'd9,  SK_CLASS_JMP   = 4'd10, SK_CLASS_SREAD = 4'd11,
+        SK_CLASS_SYS    = 4'd12, SK_CLASS_SHFL  = 4'd13, SK_CLASS_VOTE  = 4'd14
+    } sk_class_e;
+
     /// `CMP` 的谓词组合修饰（主操作码低 2 位）。
     localparam logic [1:0] SK_BOP_SET = 2'd0, SK_BOP_AND = 2'd1,
                            SK_BOP_OR  = 2'd2, SK_BOP_XOR = 2'd3;

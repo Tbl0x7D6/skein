@@ -179,12 +179,24 @@ case 用例。
 - `rtl/mem/SK_coalescer.sv`：同一 cache line 的 active lane 合并成一次事务。
 - `rtl/mem/SK_smem.sv`：多 bank shared memory + 冲突检测与 replay。
 - `rtl/mem/SK_axi_master.sv`：AXI4 突发读写（先 64-bit，后 128/512-bit）。
-- `AXI_*` 性能计数器（事务 / beat / 字节 / 停顿，M5 的对比表用，见 §13）。
-- `rtl/mem/SK_l1_cache.sv`（可选）：直接映射或 2 路组相联。
-- 优化版 vecadd/sgemm，测量与理论带宽的差距。
+- `rtl/mem/SK_l1_cache.sv`：16 KB 直接映射、写回 + 写分配、单 MSHR，跑完 flush 脏行。
+- `tb/tb_top.sv` + `tb/tb_axi_mem.sv`：核 + AXI 从机的仿真顶层，延迟可配（M5 用 20 拍）。
+- `AXI_*` / `L1_*` / 指令分类性能计数器（M5 的对比表用，见 design.md §13）。
+- `cases/bench/`：streaming vecadd（n=1024）和 64×64 int32 sgemm（ISA 没有 FPU，
+  先用整数模拟），加 `make m5` 出 base / coal / full 对照表。
 
-**验收**：sgemm（64×64 单精度，整数模拟亦可）跑通；访存合并后总线事务数相比
-未合并版本下降 ≥ 4 倍。
+**验收**：64×64 int32 sgemm 跑通且逐元素和参考一致；访存合并后总线事务数相比
+未合并版本下降 ≥ 4 倍（vecadd 读写各 4×，sgemm 读 4×）。
+
+**状态**：已完成。`cases/bench/` 里是 streaming vecadd（n=1024）和 int32
+sgemm 64×64（A 转置进 shared，内层 LDS 无 bank 冲突）；`make m5` 用 base / coal /
+full 三种配置出对照表（design.md §12.11）：vecadd 的读+写事务下降到 1/4，
+sgemm 的读事务下降到 1/4、写由 L1 从 4096 笔压到 256 笔；20 拍延迟下 full 相比
+coal：vecadd 21086 → 14540 拍、sgemm 1075168 → 995036 拍。定向用例补了
+`directed/coalesce`（同 line 合并 / 同 word 冲突写 / 跨 line）和 `directed/smem_conflict`
+（4 轮 bank 冲突 + 同地址广播），越界由 `errors/gmem_oob` 覆盖。`make rtl-sim` 30 PASS。
+4 lane + 默认配置的综合结果 WNS +0.538 ns @200 MHz（LUT 32.3K、BRAM 16），
+§1 的面积预算跟着放宽到 35K LUT。
 
 ## P6 — 上板 U250
 
@@ -234,6 +246,11 @@ case 用例。
 （默认 `4 8 16`）各综合一遍（`opt_design` 为止，只有综合后的 WNS 估计），
 LUT/FF/DSP/URAM 和 WNS 落在 `build/syn/lanes*/`。它是手动目标，不进 `regress`。
 
+内存层次的对照实验用 `make m5`：同一个 testbench 按 `SK_COALESCE`/`SK_L1` 编出
+base / coal / full 三份模型，跑 `cases/bench/`，把 cycles、IPC、AXI 事务/字节/等待、
+L1 命中率和 LDS replay 写进 `build/m5/report.txt`（AXI 延迟按 DDR4 的 20 拍算）。
+也是手动目标，不进 `regress`；结论抄在 design.md §12.11。
+
 ### case（双仿真器对拍）
 
 `cases/` 下的 `*.toml` 是唯一的用例输入描述：黄金模型和 RTL testbench 吃同一份，
@@ -246,6 +263,7 @@ cases/
   directed/          单条指令或小序列的定向用例（单 warp × 4 lane，RTL 全跑）
   errors/            错误码：保留编码、非对齐、取指越界（只比 status/trap）
   kernels/<kernel>/  真 kernel 的用例，按 kernel 分目录（vecadd / matmul / mask）
+  bench/             M5 的对照负载（streaming vecadd、sgemm64），也进回归
 ```
 
 ```toml
@@ -255,6 +273,7 @@ nwarp = 1                   # 默认 4（黄金模型模拟的机器容量；RTL
 block_dim = 4               # 可选，默认用满容量（nwarp × warpsz）；RTL 按它激活 warp
 grid = 1
 max_steps = 100000          # 可选，黄金模型的步数上限
+max_cycles = 200000         # 可选，RTL 的时钟上限（默认 testbench 的 200000）
 
 [sreg]                      # 主机写的特殊寄存器
 PTR_A = 0x1000
@@ -285,14 +304,15 @@ max_steps = 20480
   `grid > 1` 的 case 报 SKIP 并注明原因；runner 和 Makefile 里都不写死 lane 数。
 - `make rtl-sim`：每个 case 先跑黄金模型、再跑 RTL，逐项比 status / pc / `M` / GPR /
   谓词 / `[[check]]` 窗口，外加 RTL 的 `INST_RETIRED` 和黄金模型的 `steps`、
-  `BARRIERS` 和黄金模型的屏障次数。
+  `BARRIERS` 和黄金模型的屏障次数，以及 15 个指令分类的 retired 计数和黄金模型的
+  `op_counts` 逐类对拍。
 - 黄金模型报错（`status != OK`）时只比 status 和 trap（`SK_core` 里"停在哪条 warp
   的哪个 PC"的寄存器）：出错之后哪些 lane 已经提交、内存写进去多少属于实现行为，
   不是架构契约（[design.md](design.md) §5.5），逐字节比只会得到假 FAIL。报告里会
   标出"只比 status/trap"。
 - 最后打印 PASS/SKIP/FAIL 计数和每个 case 的 RTL 周期数、IPC；加 `--stats` 还能看
-  发射 / 提交 / 重发 / 没发射 / LSU 排队的分解（IPC 曲线和"为什么只有 0.6"都从
-  这里看）。
+  发射 / 提交 / 重发 / 没发射 / LSU 排队，以及 LDS/STS/AXI/L1 的分解（IPC 曲线、
+  "为什么只有 0.6"、事务数都从这里看）。
 - 核容量比 case 大时（4 条 warp 的核跑单 warp 用例），多出来的 warp 必须是"没跑过"
   的样子（pc = 0、`M` = 完整 mask、GPR/谓词全 0），否则报 FAIL。
 - `make test` 里的 `tests/cases.rs` 不依赖 Verilator：每个 case 都跑一遍黄金模型并检查

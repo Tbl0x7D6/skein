@@ -1,0 +1,8 @@
+# 出错：global 越界访问报 GMEM_OOB（出错路径只比 status/trap）
+program = "gmem_oob.s"
+warpsz = 4
+nwarp = 1
+block_dim = 4
+
+[expect]
+status = "GMEM_OOB"

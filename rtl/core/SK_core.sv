@@ -28,6 +28,7 @@ module SK_core #(
     parameter int NUM_GPR    = `SK_NUM_GPR,
     parameter int NUM_PRED   = `SK_NUM_PRED,
     parameter int IMEM_DEPTH = (`SK_IMEM_KB * 1024) / 4,
+    parameter int SMEM_W     = $clog2((`SK_SMEM_KB * 1024) / 4),
     parameter int WARP_W     = (NUM_WARPS > 1) ? $clog2(NUM_WARPS) : 1,
     parameter int LANE_W     = (NUM_LANES > 1) ? $clog2(NUM_LANES) : 1,
     parameter int GPR_W      = (NUM_GPR > 1) ? $clog2(NUM_GPR) : 1
@@ -43,25 +44,47 @@ module SK_core #(
     input  logic                              imem_we_i,
     input  logic [$clog2(IMEM_DEPTH)-1:0]     imem_addr_i,
     input  logic [31:0]                       imem_wdata_i,
-    // shared memory
-    output logic [31:0]                       smem_addr_o,
-    output logic [31:0]                       smem_wdata_o,
-    output logic                              smem_we_o,
-    input  logic [31:0]                       smem_rdata_i,
-    input  logic                              smem_fault_i,
-    // global memory
-    output logic [31:0]                       gmem_addr_o,
-    output logic [31:0]                       gmem_wdata_o,
-    output logic                              gmem_we_o,
-    input  logic [31:0]                       gmem_rdata_i,
-    input  logic                              gmem_fault_i,
+    // shared memory 主机口（testbench 装初态 / 读快照；P6 可以 tie 掉）
+    input  logic                              smem_ld_we_i,
+    input  logic [SMEM_W-1:0]                 smem_ld_addr_i,   // 字地址
+    input  logic [31:0]                       smem_ld_wdata_i,
+    input  logic [SMEM_W-1:0]                 smem_rd_addr_i,   // 字地址
+    input  logic                              smem_rd_en_i,
+    output logic [31:0]                       smem_rd_data_o,
+    // global memory：AXI4 主口（64-bit、单 outstanding；P6 接 Vitis shell）
+    output logic [31:0]                       m_axi_awaddr_o,
+    output logic [7:0]                        m_axi_awlen_o,
+    output logic [2:0]                        m_axi_awsize_o,
+    output logic [1:0]                        m_axi_awburst_o,
+    output logic                              m_axi_awvalid_o,
+    input  logic                              m_axi_awready_i,
+    output logic [63:0]                       m_axi_wdata_o,
+    output logic [7:0]                        m_axi_wstrb_o,
+    output logic                              m_axi_wlast_o,
+    output logic                              m_axi_wvalid_o,
+    input  logic                              m_axi_wready_i,
+    input  logic [1:0]                        m_axi_bresp_i,
+    input  logic                              m_axi_bvalid_i,
+    output logic                              m_axi_bready_o,
+    output logic [31:0]                       m_axi_araddr_o,
+    output logic [7:0]                        m_axi_arlen_o,
+    output logic [2:0]                        m_axi_arsize_o,
+    output logic [1:0]                        m_axi_arburst_o,
+    output logic                              m_axi_arvalid_o,
+    input  logic                              m_axi_arready_i,
+    input  logic [63:0]                       m_axi_rdata_i,
+    input  logic [1:0]                        m_axi_rresp_i,
+    input  logic                              m_axi_rlast_i,
+    input  logic                              m_axi_rvalid_i,
+    output logic                              m_axi_rready_o,
     // 状态
     output logic [3:0]                        status_o,
     output logic                              done_o,
     // 调试扫描口（仿真用）：0x00-0x1F = (warp, lane) 选中的 GPR，0x20 = 该 warp 的 M，
     // 0x21 = 该 (warp, lane) 的谓词，0x22 = 架构 PC，0x23 = STATUS，0x24 = S4 阶段指令，
     // 0x25 = {done, 在跑}，0x26 = S4 阶段 PC，0x27 = 该 warp 的状态，
-    // 0x29-0x2B = trap（出错停机时才有意义），0x30-0x39 = 性能计数器（SK_perf）
+    // 0x29-0x2B = trap（出错停机时才有意义），
+    // 0x30-0x43 = 通用性能计数器，0x44-0x52 = 按指令类的 retired（SK_perf）
     input  logic [7:0]                        dbg_addr_i,
     input  logic [WARP_W-1:0]                 dbg_wid_i,
     input  logic [LANE_W-1:0]                 dbg_lane_i,
@@ -73,11 +96,12 @@ module SK_core #(
     localparam logic [NUM_LANES-1:0] FULL_MASK = '1;   // 没有部分 warp：完整 mask 就是全 lane
     localparam int WARPSZ_SHIFT = (NUM_LANES > 1) ? $clog2(NUM_LANES) : 0;
 
-    typedef enum logic [1:0] {S_IDLE, S_RUN, S_DONE} state_e;
+    typedef enum logic [1:0] {S_IDLE, S_RUN, S_FLUSH, S_DONE} state_e;
 
     state_e     state_q;
     logic [3:0] status_q;
     logic       start_pulse;
+    logic       l1_flush;
 
     // 每条 warp 的架构状态
     logic [15:0]          pc_q [NUM_WARPS];       // 取指 PC（发射时 +1，分支在执行级改）
@@ -215,16 +239,25 @@ module SK_core #(
                      || ((op_is_bar || op_is_exit) && warp_mem_wait[ifid_wid_q]));
 
     // --- 访存接口信号（LSU 实例在下面，scoreboard 和寄存器堆写口都要用）---
-    logic                 lsu_push, lsu_fault, lsu_wb_we, lsu_flush;
+    logic                 lsu_push, lsu_fault, lsu_flush;
     logic [3:0]           lsu_fault_code;
     logic [WARP_W-1:0]    lsu_fault_wid, lsu_wb_wid;
     logic [15:0]          lsu_fault_pc;
     logic [NUM_WARPS-1:0] lsu_done;
     logic                 lsu_wb_stall;
-    logic [LANE_W-1:0]    lsu_wb_lane;
     logic [GPR_W-1:0]     lsu_wb_addr;
-    logic [31:0]          lsu_wb_data;
-    logic [NUM_LANES-1:0][31:0] lsu_wb_lanes;
+    logic [NUM_LANES-1:0] lsu_wb_mask;
+    logic [NUM_LANES-1:0][31:0] lsu_wb_data;
+    // global 请求：coalescer <-> LSU
+    logic                 gm_req_start, gm_req_we, gm_done, gm_fault;
+    logic [NUM_LANES-1:0][31:0] gm_req_addr, gm_req_wdata;
+    logic [NUM_LANES-1:0] gm_req_mask;
+    logic [NUM_LANES-1:0] gm_wb_mask;
+    logic [NUM_LANES-1:0][31:0] gm_wb_data;
+    logic                 ev_lds_txn, ev_sts_txn, ev_lds_replay;
+    // shared memory：LSU <-> 4 bank SRAM
+    logic [NUM_LANES-1:0]       smem_req_mask, smem_we;
+    logic [NUM_LANES-1:0][31:0] smem_addr, smem_wdata, smem_rdata;
 
     SK_scoreboard #(.WARPS(NUM_WARPS), .NUM_GPR(NUM_GPR)) u_scoreboard (
         .clk        (clk),
@@ -298,6 +331,27 @@ module SK_core #(
     logic                       x_warp_we, x_m_we, x_push, x_bar, x_exit;
     logic [15:0]                x_npc;
     logic [3:0]                 x_fault;
+    sk_class_e                  x_class;
+
+    // 指令分类：按类 retired 计数用（和黄金模型 op_counts 同码，见 isa.rs 的 OpClass）
+    always_comb begin
+        unique case (idex_ctrl_q.op)
+            SK_OP_ALU:   x_class = (int'(idex_ctrl_q.alu_op) >= int'(SK_ALU_ADDI))
+                                ? SK_CLASS_IMM : SK_CLASS_ALU;
+            SK_OP_CMP:   x_class = SK_CLASS_CMP;
+            SK_OP_SEL:   x_class = SK_CLASS_SEL;
+            SK_OP_LOAD:  x_class = idex_ctrl_q.mem_global ? SK_CLASS_LDG : SK_CLASS_LDS;
+            SK_OP_STORE: x_class = idex_ctrl_q.mem_global ? SK_CLASS_STG : SK_CLASS_STS;
+            SK_OP_MASK:  x_class = SK_CLASS_MASK;
+            SK_OP_BRZ, SK_OP_BRNZ: x_class = SK_CLASS_BRANCH;
+            SK_OP_JMP:   x_class = SK_CLASS_JMP;
+            SK_OP_SREAD: x_class = SK_CLASS_SREAD;
+            SK_OP_SYS:   x_class = SK_CLASS_SYS;
+            SK_OP_SHFL:  x_class = SK_CLASS_SHFL;
+            SK_OP_VOTE:  x_class = SK_CLASS_VOTE;
+            default:     x_class = SK_CLASS_ALU;
+        endcase
+    end
 
     generate
         for (genvar lane = 0; lane < NUM_LANES; lane++) begin : g_alu
@@ -518,6 +572,8 @@ module SK_core #(
     logic                               exwb_warp_we_q, exwb_m_we_q, exwb_bar_q, exwb_exit_q;
     logic [15:0]                        exwb_npc_q;
     logic [3:0]                         exwb_fault_q;
+    logic [3:0]                         exwb_class_q;
+    logic                               exwb_class_ok_q;
 
     SK_lsu #(.WARPS(NUM_WARPS), .LANES(NUM_LANES), .GPR_W(GPR_W)) u_lsu (
         .clk           (clk),
@@ -533,9 +589,8 @@ module SK_core #(
         .push_mask_i   (x_mask),
         .busy_o        (warp_lsu_busy),
         .done_o        (lsu_done),
-        .wb_we_o       (lsu_wb_we),
+        .wb_mask_o     (lsu_wb_mask),
         .wb_wid_o      (lsu_wb_wid),
-        .wb_lane_o     (lsu_wb_lane),
         .wb_addr_o     (lsu_wb_addr),
         .wb_data_o     (lsu_wb_data),
         .wb_stall_i    (lsu_wb_stall),
@@ -544,24 +599,190 @@ module SK_core #(
         .fault_wid_o   (lsu_fault_wid),
         .fault_pc_o    (lsu_fault_pc),
         .flush_i       (lsu_flush),
-        .smem_addr_o   (smem_addr_o),
-        .smem_wdata_o  (smem_wdata_o),
-        .smem_we_o     (smem_we_o),
-        .smem_rdata_i  (smem_rdata_i),
-        .smem_fault_i  (smem_fault_i),
-        .gmem_addr_o   (gmem_addr_o),
-        .gmem_wdata_o  (gmem_wdata_o),
-        .gmem_we_o     (gmem_we_o),
-        .gmem_rdata_i  (gmem_rdata_i),
-        .gmem_fault_i  (gmem_fault_i)
+        .smem_req_mask_o(smem_req_mask),
+        .smem_we_o     (smem_we),
+        .smem_addr_o   (smem_addr),
+        .smem_wdata_o  (smem_wdata),
+        .smem_rdata_i  (smem_rdata),
+        .gm_req_start_o(gm_req_start),
+        .gm_req_we_o   (gm_req_we),
+        .gm_req_addr_o (gm_req_addr),
+        .gm_req_wdata_o(gm_req_wdata),
+        .gm_req_mask_o (gm_req_mask),
+        .gm_done_i     (gm_done),
+        .gm_fault_i    (gm_fault),
+        .gm_wb_mask_i  (gm_wb_mask),
+        .gm_wb_data_i  (gm_wb_data),
+        .ev_lds_txn_o  (ev_lds_txn),
+        .ev_sts_txn_o  (ev_sts_txn),
+        .ev_lds_replay_o(ev_lds_replay)
+    );
+
+    // --- shared memory：4 bank，主机口只给 testbench 用 ---
+    SK_smem #(.LANES(NUM_LANES), .BANKS(NUM_LANES)) u_smem (
+        .clk         (clk),
+        .aresetn     (aresetn),
+        .req_mask_i  (smem_req_mask),
+        .we_i        (smem_we),
+        .addr_i      (smem_addr),
+        .wdata_i     (smem_wdata),
+        .rdata_o     (smem_rdata),
+        .host_we_i   (smem_ld_we_i),
+        .host_waddr_i(smem_ld_addr_i),
+        .host_wdata_i(smem_ld_wdata_i),
+        .host_raddr_i(smem_rd_addr_i),
+        .host_re_i   (smem_rd_en_i),
+        .host_rdata_o(smem_rd_data_o)
+    );
+
+    // --- global 访存：coalescer → L1 → AXI master ---
+    // coalescer 的下游（接 L1 上游）
+    logic        c2l_valid, c2l_ready, c2l_we;
+    logic [31:3] c2l_addr;
+    logic [3:0]  c2l_len;
+    logic [63:0] c2l_wdata;
+    logic [7:0]  c2l_wstrb;
+    logic        c2l_wbeat_taken, c2l_rvalid, c2l_rlast, c2l_rready;
+    logic [63:0] c2l_rdata;
+    logic        c2l_done, c2l_fault;
+    // L1 的下游（接 AXI master）
+    logic        l2a_valid, l2a_ready, l2a_we;
+    logic [31:0] l2a_addr;
+    logic [3:0]  l2a_len;
+    logic [63:0] l2a_wdata;
+    logic [7:0]  l2a_wstrb;
+    logic        l2a_wbeat_taken, l2a_rvalid, l2a_rlast, l2a_rready;
+    logic [63:0] l2a_rdata;
+    logic        l2a_done, l2a_fault;
+    logic        l1_flush_busy, l1_flush_done;
+    logic        axi_busy;
+    logic        ev_axi_rd_txn, ev_axi_wr_txn, ev_axi_rd_beat, ev_axi_wr_beat;
+    logic        ev_l1_rd_hit, ev_l1_rd_miss, ev_l1_wr_hit, ev_l1_wr_miss, ev_l1_wb;
+
+    SK_coalescer #(.LANES(NUM_LANES)) u_coalescer (
+        .clk            (clk),
+        .aresetn        (aresetn),
+        .flush_i        (lsu_flush),
+        .req_start_i    (gm_req_start),
+        .req_we_i       (gm_req_we),
+        .req_mask_i     (gm_req_mask),
+        .req_addr_i     (gm_req_addr),
+        .req_wdata_i    (gm_req_wdata),
+        .dn_req_valid_o (c2l_valid),
+        .dn_req_ready_i (c2l_ready),
+        .dn_req_we_o    (c2l_we),
+        .dn_req_addr_o  (c2l_addr),
+        .dn_req_len_o   (c2l_len),
+        .dn_wdata_o     (c2l_wdata),
+        .dn_wstrb_o     (c2l_wstrb),
+        .dn_wbeat_taken_i(c2l_wbeat_taken),
+        .dn_rbeat_valid_i(c2l_rvalid),
+        .dn_rbeat_data_i (c2l_rdata),
+        .dn_rbeat_last_i (c2l_rlast),
+        .dn_rbeat_ready_o(c2l_rready),
+        .dn_done_i      (c2l_done),
+        .dn_fault_i     (c2l_fault),
+        .wb_we_o        (gm_wb_mask),
+        .wb_data_o      (gm_wb_data),
+        .wb_stall_i     (lsu_wb_stall),
+        .done_o         (gm_done),
+        .fault_o        (gm_fault)
+    );
+
+    SK_l1_cache #() u_l1 (
+        .clk             (clk),
+        .aresetn         (aresetn),
+        .clear_i         (start_pulse),
+        .flush_i         (l1_flush),
+        .flush_busy_o    (l1_flush_busy),
+        .flush_done_o    (l1_flush_done),
+        .up_valid_i      (c2l_valid),
+        .up_ready_o      (c2l_ready),
+        .up_we_i         (c2l_we),
+        .up_addr_i       (c2l_addr),
+        .up_len_i        (c2l_len),
+        .up_wdata_i      (c2l_wdata),
+        .up_wstrb_i      (c2l_wstrb),
+        .up_wbeat_taken_o(c2l_wbeat_taken),
+        .up_rvalid_o     (c2l_rvalid),
+        .up_rdata_o      (c2l_rdata),
+        .up_rlast_o      (c2l_rlast),
+        .up_rready_i     (c2l_rready),
+        .up_done_o       (c2l_done),
+        .up_fault_o      (c2l_fault),
+        .dn_valid_o      (l2a_valid),
+        .dn_ready_i      (l2a_ready),
+        .dn_we_o         (l2a_we),
+        .dn_addr_o       (l2a_addr),
+        .dn_len_o        (l2a_len),
+        .dn_wdata_o      (l2a_wdata),
+        .dn_wstrb_o      (l2a_wstrb),
+        .dn_wbeat_taken_i(l2a_wbeat_taken),
+        .dn_rvalid_i     (l2a_rvalid),
+        .dn_rdata_i      (l2a_rdata),
+        .dn_rlast_i      (l2a_rlast),
+        .dn_rready_o     (l2a_rready),
+        .dn_done_i       (l2a_done),
+        .dn_fault_i      (l2a_fault),
+        .ev_rd_hit_o     (ev_l1_rd_hit),
+        .ev_rd_miss_o    (ev_l1_rd_miss),
+        .ev_wr_hit_o     (ev_l1_wr_hit),
+        .ev_wr_miss_o    (ev_l1_wr_miss),
+        .ev_wb_o         (ev_l1_wb)
+    );
+
+    SK_axi_master #() u_axi (
+        .clk             (clk),
+        .aresetn         (aresetn),
+        .req_valid_i     (l2a_valid),
+        .req_ready_o     (l2a_ready),
+        .req_we_i        (l2a_we),
+        .req_addr_i      (l2a_addr),
+        .req_len_i       (l2a_len),
+        .wdata_i         (l2a_wdata),
+        .wstrb_i         (l2a_wstrb),
+        .wbeat_taken_o   (l2a_wbeat_taken),
+        .rbeat_valid_o   (l2a_rvalid),
+        .rbeat_data_o    (l2a_rdata),
+        .rbeat_last_o    (l2a_rlast),
+        .rbeat_ready_i   (l2a_rready),
+        .done_o          (l2a_done),
+        .fault_o         (l2a_fault),
+        .busy_o          (axi_busy),
+        .ev_rd_txn_o     (ev_axi_rd_txn),
+        .ev_wr_txn_o     (ev_axi_wr_txn),
+        .ev_rd_beat_o    (ev_axi_rd_beat),
+        .ev_wr_beat_o    (ev_axi_wr_beat),
+        .m_axi_awaddr_o  (m_axi_awaddr_o),
+        .m_axi_awlen_o   (m_axi_awlen_o),
+        .m_axi_awsize_o  (m_axi_awsize_o),
+        .m_axi_awburst_o (m_axi_awburst_o),
+        .m_axi_awvalid_o (m_axi_awvalid_o),
+        .m_axi_awready_i (m_axi_awready_i),
+        .m_axi_wdata_o   (m_axi_wdata_o),
+        .m_axi_wstrb_o   (m_axi_wstrb_o),
+        .m_axi_wlast_o   (m_axi_wlast_o),
+        .m_axi_wvalid_o  (m_axi_wvalid_o),
+        .m_axi_wready_i  (m_axi_wready_i),
+        .m_axi_bresp_i   (m_axi_bresp_i),
+        .m_axi_bvalid_i  (m_axi_bvalid_i),
+        .m_axi_bready_o  (m_axi_bready_o),
+        .m_axi_araddr_o  (m_axi_araddr_o),
+        .m_axi_arlen_o   (m_axi_arlen_o),
+        .m_axi_arsize_o  (m_axi_arsize_o),
+        .m_axi_arburst_o (m_axi_arburst_o),
+        .m_axi_arvalid_o (m_axi_arvalid_o),
+        .m_axi_arready_i (m_axi_arready_i),
+        .m_axi_rdata_i   (m_axi_rdata_i),
+        .m_axi_rresp_i   (m_axi_rresp_i),
+        .m_axi_rlast_i   (m_axi_rlast_i),
+        .m_axi_rvalid_i  (m_axi_rvalid_i),
+        .m_axi_rready_o  (m_axi_rready_o)
     );
 
     // --- 寄存器堆写口：流水线提交（优先）和 LSU 回写 ---
     // 两条写撞在同一个 warp 上时让 LSU 等一拍（`lsu_wb_stall`），一个写口就够。
     always_comb begin
-        for (int lane = 0; lane < NUM_LANES; lane++) begin
-            lsu_wb_lanes[lane] = (LANE_W'(lane) == lsu_wb_lane) ? lsu_wb_data : 32'd0;
-        end
         for (int warp = 0; warp < NUM_WARPS; warp++) begin
             rf_we[warp]    = 1'b0;
             rf_wlane[warp] = '0;
@@ -572,11 +793,12 @@ module SK_core #(
                 rf_wlane[warp] = exwb_warp_we_q ? '1 : exwb_we_q;
                 rf_waddr[warp] = exwb_rd_q;
                 rf_wdata[warp] = exwb_data_q;
-            end else if (lsu_wb_we && !lsu_flush && (lsu_wb_wid == WARP_W'(warp))) begin
+            end else if ((lsu_wb_mask != '0) && !lsu_flush
+                         && (lsu_wb_wid == WARP_W'(warp))) begin
                 rf_we[warp]    = 1'b1;
-                rf_wlane[warp] = NUM_LANES'(1) << lsu_wb_lane;
+                rf_wlane[warp] = lsu_wb_mask;
                 rf_waddr[warp] = lsu_wb_addr;
-                rf_wdata[warp] = lsu_wb_lanes;
+                rf_wdata[warp] = lsu_wb_data;
             end
         end
     end
@@ -613,21 +835,38 @@ module SK_core #(
 
     // 一条 RUN 状态的 warp 都没有：都在 BAR 上等 / 已经 EXIT。计数器只在 S_RUN 累加，
     // 所以这里不带状态判断。
-    assign no_run_warp = (warp_run == '0);
+    // 只管 S_RUN：S_FLUSH 是收尾（脏行写回），不算"没 warp 可发"
+    assign no_run_warp = (warp_run == '0) && (state_q == S_RUN);
 
     SK_perf u_perf (
-        .clk        (clk),
-        .aresetn    (aresetn),
-        .start_i    (start_pulse),
-        .run_i      (state_q == S_RUN),
-        .issued_i   (issue_valid),
-        .retired_i  (exwb_valid_q),
-        .replay_i   (replay),
-        .barrier_i  (bar_release),
-        .no_warp_i  (no_run_warp),
-        .lsu_busy_i (|warp_lsu_busy),
-        .addr_i     (dbg_addr_i[3:0]),
-        .data_o     (perf_data)
+        .clk            (clk),
+        .aresetn        (aresetn),
+        .start_i        (start_pulse),
+        // flush 也是这次 block 的一部分（脏行写回），一起计
+        .run_i          ((state_q == S_RUN) || (state_q == S_FLUSH)),
+        .issued_i       (issue_valid),
+        .retired_i      (exwb_valid_q),
+        .replay_i       (replay),
+        .barrier_i      (bar_release),
+        .no_warp_i      (no_run_warp),
+        .lsu_busy_i     (|warp_lsu_busy),
+        .lds_txn_i      (ev_lds_txn),
+        .sts_txn_i      (ev_sts_txn),
+        .lds_replay_i   (ev_lds_replay),
+        .axi_rd_txn_i   (ev_axi_rd_txn),
+        .axi_wr_txn_i   (ev_axi_wr_txn),
+        .axi_rd_beat_i  (ev_axi_rd_beat),
+        .axi_wr_beat_i  (ev_axi_wr_beat),
+        .axi_stall_i    (axi_busy),
+        .l1_rd_hit_i    (ev_l1_rd_hit),
+        .l1_rd_miss_i   (ev_l1_rd_miss),
+        .l1_wr_hit_i    (ev_l1_wr_hit),
+        .l1_wr_miss_i   (ev_l1_wr_miss),
+        .l1_wb_i        (ev_l1_wb),
+        .class_i        (exwb_class_q),
+        .class_valid_i  (exwb_class_ok_q),
+        .addr_i         (dbg_addr_i[5:0]),
+        .data_o         (perf_data)
     );
 
     assign status_o = status_q;
@@ -759,6 +998,8 @@ module SK_core #(
                         exwb_fault_q    <= x_fault;
                         exwb_bar_q      <= x_bar;
                         exwb_exit_q     <= x_exit;
+                        exwb_class_q    <= x_class;
+                        exwb_class_ok_q <= (idex_ctrl_q.op != SK_OP_ILLEGAL);
 
                         // 取指 PC 的三件事各改各的 warp，不能写成全局 if/else：
                         // 别的 warp 在发射时，重发的那条也必须把 PC 回退。
@@ -794,7 +1035,8 @@ module SK_core #(
 
                         // 所有 warp 都结束：整台核收工
                         if (all_done) begin
-                            state_q <= S_DONE;
+                            // 先把 L1 的脏行写回，主机看到的内存才是最终值
+                            state_q <= S_FLUSH;
                         end
                     end
 
@@ -820,10 +1062,15 @@ module SK_core #(
                         end
                     end
                 end
+                S_FLUSH: begin
+                    if (l1_flush_done) state_q <= S_DONE;
+                end
                 default: ;                             // S_DONE：保持
             endcase
         end
     end
+
+    assign l1_flush = (state_q == S_FLUSH);
 
     // --- 调试扫描口（仿真用）---
     always_comb begin
@@ -840,7 +1087,8 @@ module SK_core #(
             8'h29:   dbg_data_o = {31'd0, trap_valid_q};
             8'h2A:   dbg_data_o = {30'd0, trap_wid_q};
             8'h2B:   dbg_data_o = {16'd0, trap_pc_q};
-            default: dbg_data_o = (dbg_addr_i >= 8'h30) ? perf_data
+            8'h2C:   dbg_data_o = {30'd0, l1_flush_busy, (state_q == S_FLUSH)};
+            default: dbg_data_o = ((dbg_addr_i >= 8'h30) && (dbg_addr_i <= 8'h52)) ? perf_data
                                  : ((dbg_addr_i < 8'd32) ? gpr_dbg : 32'd0);
         endcase
     end

@@ -1,0 +1,23 @@
+# 定向：shared bank 冲突（4 轮）与同地址广播 / 同地址写去重（1 轮）
+program = "smem_conflict.s"
+warpsz = 4
+nwarp = 1
+block_dim = 4
+
+[[init]]
+space = "smem"
+addr = 256
+words = [0x55]
+
+[[check]]
+space = "smem"
+addr = 64
+words = 4
+
+[[check]]
+space = "smem"
+addr = 256
+words = 1
+
+[expect]
+status = "OK"
