@@ -23,8 +23,19 @@ make m5                                                          # M5 对照：b
 make regress                                                    # 上面全跑一遍：fmt + clippy + test + lint + 仿真
 ```
 
+上板：
+
+```bash
+./syn/u250/build_xo.sh build/u250                                # RTL → .xo（Vivado package_xo 流程）
+KERNEL_FREQ=150 ./syn/u250/build_xclbin_alt.sh build/u250_150 syn/u250/link_slr2.cfg
+# 板卡机上：先把 shell 切到 xdma（practice.md §2.6），再
+sudo sw/runtime/skein_run --xclbin <xclbin> --image <vecadd.bin> --workload vecadd
+```
+
 `make rtl-sim` 每行是 `case 名 + cycles + IPC`（`--stats` 还能看发射 / 提交 / 重发 /
-没发射 / LSU 排队 / LDS / AXI / L1 的分解），30 个 case 全 PASS。想单独看某个 case：
+没发射 / LSU 排队 / LDS / AXI / L1 的分解），33 个 case 全 PASS——每个 case 都按
+板上的主机流程跑（AXI-Lite 写 IMEM 和参数 → start → 轮询 done → 扫描口读状态）。
+想单独看某个 case：
 
 ```bash
 cargo run --manifest-path tools/Cargo.toml --bin skein-case -- \
@@ -56,7 +67,8 @@ cargo run --manifest-path tools/Cargo.toml --bin skein-case -- \
 ```
 rtl/       可综合 RTL。lib/ 通用原语，core/ 译码执行提交与 SK_core，sched/ warp
            调度与 scoreboard，mem/ IMEM、4 bank shared、coalescer、16 KB L1 与
-           AXI4 master，top/ 上板壳；SK_config.vh 是全局参数，SK_pkg.sv 是公共类型
+           512-bit AXI4 master，top/ 主机接口（SK_ctrl）与上板壳（SK_top / SK_afu）；
+           SK_config.vh 是全局参数，SK_pkg.sv 是公共类型
 tools/     Rust 工具链（一个 cargo crate）：src/isa.rs 编码定义、src/asm.rs 汇编器
            （一行一条指令）、src/golden.rs 黄金模型、src/case.rs 用例加载、
            src/bin/ 里的 skein-asm / skein-run / skein-case（命令行用 clap）、
@@ -64,12 +76,13 @@ tools/     Rust 工具链（一个 cargo crate）：src/isa.rs 编码定义、sr
 cases/     用例：程序 + launch 形状 + 初态 + 比对窗口，golden 和 RTL 共用（*.toml）；
            directed/ 定向、errors/ 错误码、kernels/<kernel>/ 按 kernel 分目录
            （kernel 汇编源码和它的用例放一起）、bench/ 是 M5 的对照负载
-tb/        Verilator testbench：tb_top = SK_core + tb_axi_mem（AXI 从机 + 内存模型），
-           tb_core.cpp 喂输入、跑、dump 状态；--print-shape 报核的形状，skein-case
-           用它决定哪些 case 能跑
+tb/        Verilator testbench：tb_top = AXI-Lite 主机 + SK_top（控制 + 核）+
+           tb_axi_mem（AXI 从机 + 内存模型），tb_core.cpp 喂输入、跑、dump 状态；
+           --print-shape 报核的形状，skein-case 用它决定哪些 case 能跑
 syn/       综合脚本：synth_core.tcl 按 lane 数扫面积/时序；u250/ 是 P6 的 v++ 打包
-           脚本与链接配置
-sw/        主机程序：runtime/ XRT 驱动、tests/ 上板用例
+           脚本（package_xo.tcl + build_xo.sh + build_xclbin.sh + kernel.xml/link.cfg）
+sw/        主机程序：runtime/skein_run.cpp 是 XRT 上板驱动（写寄存器跑 vecadd/sgemm 并
+           和主机侧参考值比对），tests/ 放上板用例
 ```
 
 每个文件在对应阶段创建，清单见 [docs/plan.md](docs/plan.md)。

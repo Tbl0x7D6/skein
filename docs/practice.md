@@ -168,26 +168,30 @@ end
 
 ## 2. U250 上板（P6）
 
-### 2.1 打包（开发机）
+### 2.1 打包
 
-打包前先让 `$PLATFORM` 指向 U250 的 `.xpfm`。接口约定见 [design.md](design.md) §9，
-`SK_afu` 的 RTL 直接交给 `v++`：
+手写 RTL kernel 的打包走 Vivado 的 `package_xo` 流程（RTL Kernel Wizard 背后
+那套），**不是**把 `.sv` 丢给 `v++ -c`——那条路会把文件当 HLS 源码，报
+`Cannot find any design unit to elaborate`。脚本都在 `syn/u250/`：
 
 ```bash
-cd syn/u250
-
-v++ -c --platform $PLATFORM --target hw --kernel SK_afu \
-    -o build/SK_afu.xo rtl/top/SK_afu.v ...      # RTL kernel：.v 直接给 v++
-
-v++ -l --platform $PLATFORM --target hw \
-    --config link.cfg -o build/skein.xclbin build/SK_afu.xo
+./syn/u250/build_xo.sh          # RTL → build/u250/SK_afu.xo（Vivado，几十秒）
+./syn/u250/build_xclbin.sh      # .xo → .xclbin（v++ -l，30–90 分钟，挂后台写 link.log）
 ```
 
-注意事项：
+踩过的点：
 
-1. RTL kernel 不必先走"综合成 `.xo`"的传统流程，可以直接用 `v++ -l` 打包 RTL。
-2. 环境里不要导出 `XILINX_XRT`，否则打包最后一步会用到 XRT 的 xclbinutil 而失败。
-3. 链接很慢，U250 上一次 1 核设计预计 30–90 分钟，用 `setsid nohup … &` 挂着跑。
+1. `kernel.xml` 里每个 `m_axi` 端口至少要有一个 `addressQualifier="1"` 的指针参数
+   映射上去，否则链接第一步报 *port is not mapped from any kernel argument*；
+   我们的 `gmem_base` 就是那个指针（主机仍用 `write_register` 写它）。
+2. `kernel.xml` 的 `vlnv` 必须和 IP 的 vendor:library:name:version 一致
+   （脚本用 `-vendor skein.com -library kernel -name SK_afu -version 1.0`）。
+3. 登录 profile 里设了 `XILINX_XRT`，链接前要 `env -u XILINX_XRT v++ -l ...`。
+4. 平台默认 kernel 时钟 300 MHz，我们只收敛到 200 MHz：链接带
+   `--kernel_frequency 200`。
+5. IP 要显式关联时钟（`ipx::associate_bus_interfaces -busif … -clock ap_clk`），
+   并给 `m_axi_gmem` 声明 `MAX_BURST_LENGTH=1` 和单 outstanding，interconnect
+   才知道怎么连。
 
 ### 2.2 目标机准备
 
@@ -202,51 +206,58 @@ sudo xbmgmt program --base -d <BDF> \
      --image /lib/firmware/xilinx/f8dac62e49d9b0aae9fc6f260d9d0dfb
 sudo reboot
 
-# 3) 确认
-xbutil examine          # Platform 一行应显示 xilinx_u250_gen3x16_xdma_4_1_202210_1
+# 3) 确认（新版 XRT 里 xbutil 改叫 xrt-smi）
+sudo xrt-smi examine    # Device Ready 应为 Yes，Shell 是 ..._shell_4_1
 ```
+
+在板卡机上跑 XRT 通常要特权（用户不在 render 组时），命令前面加 `sudo`。
+编译主机程序前先装 `uuid-dev`（XRT 头文件依赖 `uuid/uuid.h`）。
 
 ### 2.3 主机程序
 
-主机程序用 XRT 原生 API（`xrt::device` / `xrt::bo` / `xrt::kernel`）。和旧方案的
-区别是：**启动前要先通过 `s_axi_control` 的 IMEM 装载口把指令镜像写进去**，
-然后再写 kernel 参数。
+主机程序在 `sw/runtime/skein_run.cpp`（XRT 原生 API）。要点是**不通过 `krnl(...)`
+传参**，全部走 `s_axi_control` 的寄存器（`write_register`/`read_register`，在
+XRT 2.21 里标了 deprecated 但仍然是那条 AXI-Lite 通路）：IMEM 镜像、参数、
+`GMEM_BASE`（BO 的设备地址，写 0x30/0x34）、`CTRL.start`，然后轮询 `CTRL.done`。
+核里的指针是 32 位偏移，AXI 地址由 master 加上 `GMEM_BASE`——BO 的地址可能
+超过 4 GB，所以不能把 BO 地址直接当 kernel 里的指针用。
 
 ```cpp
-#include <xrt/xrt_device.h>
-#include <xrt/xrt_bo.h>
-#include <xrt/xrt_kernel.h>
-
 xrt::device device(0);
 auto uuid = device.load_xclbin("skein.xclbin");
 xrt::kernel krnl(device, uuid, "SK_afu");
 
-// 1) 通过 register map 装载 IMEM 镜像（每字一个 AXI-Lite 写）
-// 2) 写 GRID_DIM / BLOCK_DIM / PTR_A/B/C / ARG0..（BLOCK_DIM 必须是 SK_NUM_LANES 的整数倍）
-
-// 3) 数据缓冲
-xrt::bo bo_a(device, bytes, krnl.group_id(0));
-...
-bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-auto run = krnl(bo_a, bo_b, bo_c, n);      // 参数顺序 = kernel 形参顺序
-run.wait();
-bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+// 一块 BO 装下 A/B/C（偏移和 case 里一样）
+xrt::bo bo(device, 1 << 20, krnl.group_id(0));
+uint64_t base = bo.address();
+// 写 IMEM 镜像（ADDR → WDATA → WE=1 每个字一次）、写参数，再写 GMEM_BASE
+krnl.write_register(0x030, (uint32_t)base);
+krnl.write_register(0x034, (uint32_t)(base >> 32));
+krnl.write_register(0x000, 1);                  // CTRL.start
+while (!(krnl.read_register(0x000) & 2)) {}     // 轮询 done
 ```
 
-在目标机上编译（本机 Arch 的 glibc/boost 和 XRT 不匹配）：
+在板卡机上编译（开发机的 glibc/boost 可能与 XRT 不匹配）：
 
 ```bash
-g++ -g -O2 -std=c++17 -I$XILINX_XRT/include host.cpp \
-    -o skein_run -L$XILINX_XRT/lib -lxrt_coreutil -pthread
+g++ -O2 -std=c++17 -Wno-deprecated-declarations skein_run.cpp \
+    -o skein_run -lxrt_coreutil -luuid -pthread
 ```
 
-### 2.4 板卡限制
+### 2.4 板卡限制与 SLR/DDR 映射
 
-- v0.1 只使用 `DDR[0]`（16 GB，理论约 19 GB/s）。多 bank 需要编译期未知的 XRT
-  虚拟地址偏移，先不做。
-- Vitis 平台会把 `gmem0` 默认映射到某个 bank，要用
-  `--connectivity.sp SK_afu_1.m_axi_gmem:DDR[0]` 显式指定到 `DDR[0]`。
-- 平台 shell 占掉约 15% 资源，U250 留给用户的是 1,488,120 LUT / 10,634 DSP。
+- 平台的三个 DDR4 子系统按 `preopt.tcl` 里的 pblock 分别落在 **SLR0（`DDR[0]`/mem00）**、
+  **SLR2（`DDR[1]`/mem01）**、**SLR3（`DDR[2]`/mem02）**；SLR1 没有内存控制器。
+  `--connectivity.slr` 把 CU 钉到哪个 SLR，`--connectivity.sp` 就把它的数据绑到那个
+  SLR 的内存上（`syn/u250/link_slr*.cfg`）。
+- SLR0 最挤：XDMA/interconnect/`clkwiz_aclk_kernel_*` 都在里面，整个设计在 SLR0 已经
+  占到约 28% 的 CLB；SLR2 约 6%，SLR3 基本是空的。P6.3 把 CU 钉在 SLR0 时，512-bit
+  AXI 打进去会堵到拥堵等级 6、全局布线几小时不收敛；换 SLR 是首选手段。
+- 板上有 16 GB × 4 个 bank（bank3 报成 MEM_DRAM）+ 4 × 128 KB PLRAM，v0.1 只用其中
+  一个 bank。主机把 BO 地址写进 `GMEM_BASE`（0x30/0x34）告诉核，所以换 bank 不用改
+  RTL：BO 由 XRT 按 kernel 的 `sp` 映射分配，基址可能是 0x4/0x5/0x6_0000_0000。
+- 平台 shell 占掉约 15% 资源，U250 留给用户的是 1,488,120 LUT / 10,634 DSP（空闲
+  SLR2/SLR3 的 LUT/BRAM 都在这个预算里，钉 SLR 只是选地方放）。
 
 ### 2.5 上板调试顺序
 
@@ -257,3 +268,55 @@ g++ -g -O2 -std=c++17 -I$XILINX_XRT/include host.cpp \
 5. IMEM 装载和入口 PC 是否正确（先跑一个只做 `EXIT` 的空 kernel）。
 6. 小规模数据与仿真 dump 逐字节比对。
 7. 放大规模，记录实际频率与带宽。
+
+### 2.6 让卡跑在 xdma shell 上（DFX-2RP 的 shell 分区编程）
+
+这个平台是 **DFX-2RP**：flash 里是 **base 平台**（`xilinx_u250_gen3x16_base_4`，
+逻辑 UUID `F8DAC62E…`、接口 UUID `807a580e…`），它只提供 PCIe + ICAP；核要的
+**xdma shell**（`xilinx_u250_gen3x16_xdma_shell_4_1`，接口 UUID `a8880c23…`）是
+运行时编进 RP 分区的。两者不匹配时 xocl 直接拒收（Xilinx 自带的
+`xdma-shell/test/verify.xclbin` 也一样，所以不是我们 xclbin 的问题）：
+
+```
+xocl_fdt_check_uuids: Can not find uuid a8880c2311a2a42b5fb76899d385acee
+xocl_read_axlf_helper: interface uuids do not match   →  err -22
+```
+
+**能用的办法**（XRT 2.21 不会自动下载 shell；`xbmgmt program --base shell --image=
+<shell xsabin>` 走的是写 flash，要 MCS 镜像，包装里没有）——直接走驱动的 ICAP
+字符设备 + `rp_program`（语义见 `driver/xocl/subdev/icap.c` 的 `icap_write_rp` 和
+`driver/xocl/mgmtpf/mgmt-sysfs.c` 的 `rp_program_store`）：
+
+```bash
+# 1) 把 shell 的 xsabin 暂存给驱动（它会解析 axlf、存下 bit + SC 固件）
+sudo sh -c 'cat /lib/firmware/xilinx/a8880c2311a2a42b5fb76899d385acee/partition.xsabin \
+            > /dev/xfpga/icap.m256.0'
+# 2) 请求编程 RP：1 = 从暂存的镜像装 shell，2 = 走「重编 shell」的完整流程
+echo 1 | sudo tee /sys/class/xrt_mgmt/xclmgmt256/device/rp_program
+# 3) 确认（约 20–40 秒后）
+sudo xrt-smi examine -r platform | grep -E "XSA Name|Logic UUID"
+# 期望：xilinx_u250_gen3x16_xdma_shell_4_1 / 12C8FAFB-0632-499D-B1C0-C6676271B8A6
+```
+
+注意：
+
+- **shell 是易失的**：`rmmod/modprobe xclmgmt`、host 重启、`xbmgmt program --boot …`
+  都会让卡回到 flash 里的 base 平台，要重新做上面三步（每次约 1 分钟）。
+- `rp_program` 在**没暂存镜像**时写 1 会失败（`Invalid reprogram request`）并且把标志
+  卡在 REQ（之后写 1 报 EBUSY）——重载一次 xclmgmt 清状态、先暂存再写 1 即可。
+- 装 shell 时驱动会等 MIG 校准（10 秒）并可能报 `program prp failed -62`（ETIMEDOUT）；
+  这个时候 shell 其实**已经装进去了**（platform 显示 xdma shell），DDR 也能用
+  （`xrt-smi examine -r memory` 能列出 bank0–3 的温度就是证明）。别急着重来。
+- 上板前先看 `xrt-smi examine -r platform` 的 `XSA Name`：是 base 就先把 shell 装上。
+
+### 2.7 主机程序（XRT 原生 API）的两个坑
+
+写 `skein_run` 时踩到、并且和 `kernel.xml` 的写法直接相关的两条：
+
+1. **BO 要按连 m_axi 的那个参数分配**。我们的 `kernel.xml` 里指针参数
+   `gmem_base` 的 id 是 **8**（0..7 都是标量寄存器参数），所以必须
+   `kernel.group_id(8)`；写成 `group_id(0)` 时 XRT 会拿标量参数的内存组，去分配
+   host/userptr BO，报 `failed to allocate userptr bo: Operation not permitted`。
+2. **`read_register`/`write_register` 要 CU 独占访问**：`xrt::kernel` 默认是 shared，
+   XRT 2.21 下会抛 `Cannot read or write kernel with shared access`；构造时传
+   `xrt::kernel::cu_access_mode::exclusive`。

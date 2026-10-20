@@ -178,7 +178,8 @@ case 用例。
 
 - `rtl/mem/SK_coalescer.sv`：同一 cache line 的 active lane 合并成一次事务。
 - `rtl/mem/SK_smem.sv`：多 bank shared memory + 冲突检测与 replay。
-- `rtl/mem/SK_axi_master.sv`：AXI4 突发读写（先 64-bit，后 128/512-bit）。
+- `rtl/mem/SK_axi_master.sv`：AXI4 主口（P6.2 起 512-bit、一次一整行 64 B，
+  上游仍是 64-bit beat 接口）。
 - `rtl/mem/SK_l1_cache.sv`：16 KB 直接映射、写回 + 写分配、单 MSHR，跑完 flush 脏行。
 - `tb/tb_top.sv` + `tb/tb_axi_mem.sv`：核 + AXI 从机的仿真顶层，延迟可配（M5 用 20 拍）。
 - `AXI_*` / `L1_*` / 指令分类性能计数器（M5 的对比表用，见 design.md §13）。
@@ -196,7 +197,8 @@ coal：vecadd 21086 → 14540 拍、sgemm 1075168 → 995036 拍。定向用例�
 `directed/coalesce`（同 line 合并 / 同 word 冲突写 / 跨 line）和 `directed/smem_conflict`
 （4 轮 bank 冲突 + 同地址广播），越界由 `errors/gmem_oob` 覆盖。`make rtl-sim` 30 PASS。
 4 lane + 默认配置的综合结果 WNS +0.538 ns @200 MHz（LUT 32.3K、BRAM 16），
-§1 的面积预算跟着放宽到 35K LUT。
+§1 的面积预算跟着放宽到 35K LUT（P6 加了主机接口/512-bit master 之后是
+33.2K LUT、WNS +0.523 ns，见 design.md §12.6）。
 
 ## P6 — 上板 U250
 
@@ -204,9 +206,11 @@ coal：vecadd 21086 → 14540 拍、sgemm 1075168 → 995036 拍。定向用例�
 
 **交付物**
 
-- `rtl/top/SK_afu.v`：Vitis RTL kernel 壳（AXI-Lite 控制 + AXI4 主 + `ap_ctrl`）。
-- `rtl/top/SK_top.sv`、`rtl/top/SK_ctrl.sv`：核与主机接口的集成（AXI-Lite 参数、
-  IMEM 装载口、start/done/error）。
+- `rtl/top/SK_ctrl.sv`：AXI-Lite 控制口（§5.6 的寄存器表、IMEM 装载口、调试扫描口，
+  多 block 的启动序列）。
+- `rtl/top/SK_top.sv`：`SK_ctrl` + `SK_core` + AXI 主口，仿真和上板共用的一层。
+- `rtl/top/SK_afu.sv`：Vitis RTL kernel 壳（`ap_clk`/`ap_rst_n` + 标准控制口 +
+  512-bit AXI 主口）。
 - `syn/u250/`：`v++` 打包脚本（kernel → `.xo` → `.xclbin`）。
 - `sw/runtime/`：XRT 原生 API 主机程序，负责装载 IMEM、写参数、轮询 done/error。
 - `sw/tests/`：vecadd → sgemm 逐个上板验证。
@@ -215,6 +219,35 @@ coal：vecadd 21086 → 14540 拍、sgemm 1075168 → 995036 拍。定向用例�
 **验收**：U250 上跑通 sgemm，结果与仿真逐字节一致，并记录实际频率与资源占用。
 
 **限制**：U250 上只有单条 DDR4 通道（16 GB，约 19 GB/s），工作集要压小。
+
+**状态**：P6.1（主机接口）和 P6.2（512-bit AXI + `GMEM_BASE`）已完成：
+
+- `SK_ctrl`/`SK_top`/`SK_afu` 落地，仿真 testbench 改成走 AXI-Lite 主机流程
+  （写 IMEM、写参数、start、轮询 done、扫描口读状态），
+  `make rtl-sim` 33 PASS / 0 SKIP / 0 FAIL（新增 `directed/grid2` 多 block、
+  `directed/gmem_base` 64 位基址、`errors/bad_launch`）。
+- master 改成 512-bit、一次一整行 64 B：上游（coalescer 组 / L1 整行）压成
+  len=0、size=6 的事务，读回来再切片；`GMEM_BASE`（主机写 0x30/0x34）加到核内
+  32 位偏移上——U250 的 BO 地址可能超过 4 GB。M5 的数字按新口径重测过（§12.11）。
+- P6.3：`.xo` 能稳定产出（Vivado `package_xo` 流程，手写 RTL 不能走 `v++ -c`）。
+  布线阶段试了 7 条链接，只有 **150 MHz + SLR2 + DDR[1]** 这条收敛：
+  `build/u250_150/skein.xclbin`（44 MB，时序 WNS +0.012 ns / WHS +0.010 ns @150 MHz）；
+  同样配置在 200 MHz（不钉 SLR / SLR0 / SLR2 / SLR3）全部 "Kernel link failed to
+  complete"。原因见 practice.md §2.4：CU 连 `DDR[0]` 会落在最挤的 SLR0，200 MHz
+  下布线拥堵等级 6 收不住；降到 150 MHz 既松了时序也松了布线。
+- P6.4（上板）**完成**：`build/u250_150/skein.xclbin` 在 U250 上跑通——
+  smoke（寄存器读写 + SHAPE=0x0404）PASS、vecadd n=1024 PASS（20474 cycles /
+  4160 retired）、sgemm64 PASS（1016740 cycles / 696616 retired，4096 个输出全对）。
+  数字和踩坑写在 design.md §12.12、practice.md §2.6/§2.7（DFX-2RP 的 shell 分区
+  编程、BO 的 memory group、CU 独占访问）。
+- `sw/runtime/skein_run.cpp`（XRT 主机程序：寄存器写 IMEM/参数、轮询 done、用和 case
+  一样的生成器比对 vecadd/sgemm64）已在板卡机上编译通过，`build/board/{vecadd,sgemm64}.bin`
+  用 `skein-asm` 从 case 的 kernel 编出。
+- 后备手段：L1 + coalescer 关掉（`SK_L1=0 SK_COALESCE=0`）后核从 33.2K LUT 降到
+  27.4K LUT、BRAM 16→8（`syn/synth_area.tcl` 量的）。这个精简配置在 Verilator 模型上
+  跑完整 case 集也是 33 PASS / 0 SKIP / 0 FAIL，所以可以作为上板的后备 `.xo`
+  （`syn/u250/build_xo_lean.sh`），只是访存慢。
+- 编译与上板环境已验过：v++ 2022.1 + U250 平台；XRT 2.21.75 + shell 4.1 + Ready。
 
 ## P7 — 张量单元（可选）
 
@@ -300,8 +333,13 @@ max_steps = 20480
 （`make rtl-sim` 每行都带 IPC，`--stats` 再展开计数器）。
 
 - 形状：`skein-case` 先用 `tb_core --print-shape` 问一次核的容量（来自
-  `SK_core.shape_o`），`warpsz` 对不上、`block_dim` 超过一次能激活的线程数、或者
-  `grid > 1` 的 case 报 SKIP 并注明原因；runner 和 Makefile 里都不写死 lane 数。
+  `SK_ctrl` 的 `SHAPE` 寄存器，就是核的 `shape_o`），`warpsz` 对不上、`block_dim`
+  超过一次能激活的线程数、或者 `nwarp` 超过硬件容量的 case 报 SKIP 并注明原因；
+  runner 和 Makefile 里都不写死 lane 数。P6 起 RTL 按 `GRID_DIM` 串行跑多 block，
+  `grid > 1` 的 case 也进回归（`directed/grid2`）。
+- 主机流程在仿真里就验：`tb_core` 不直接驱动核，而是像板上 XRT 一样写 AXI-Lite
+  控制寄存器（写 IMEM、写参数、写 `CTRL.start`、轮询 done），状态和计数器从调试
+  扫描口读——寄存器映射、IMEM 装载、start/done 握手在上板前就被回归覆盖了。
 - `make rtl-sim`：每个 case 先跑黄金模型、再跑 RTL，逐项比 status / pc / `M` / GPR /
   谓词 / `[[check]]` 窗口，外加 RTL 的 `INST_RETIRED` 和黄金模型的 `steps`、
   `BARRIERS` 和黄金模型的屏障次数，以及 15 个指令分类的 retired 计数和黄金模型的

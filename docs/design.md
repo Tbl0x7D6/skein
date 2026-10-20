@@ -30,7 +30,7 @@ RTL 宏集中在 [SK_config.vh](../rtl/SK_config.vh)：
 `define SK_COALESCE     1      // 按 64 B 行合并同 warp 的访存；0 = 每 lane 一笔（M5 基线）
 `define SK_L1           1      // global 走 L1；0 = coalescer 直连 AXI
 `define SK_MEM_LINE_BYTES 64   // cache line / coalescer 的合并粒度
-`define SK_AXI_DATA_W   64     // AXI4 数据宽度（bit）
+`define SK_AXI_DATA_W   512    // AXI4 数据宽度（bit）：一行 64 B，对齐 shell
 ```
 
 每个宏外面套了 `ifndef` 守卫，所以综合/仿真可以用 `-verilog_define SK_NUM_LANES=8`
@@ -101,8 +101,8 @@ P3 落地的部分：`SK_imem`、`SK_decode`、`SK_regfile`、`SK_alu`、`SK_mas
   `BLOCK_DIM`（主机写的 `blockDim.x`）决定 block 有多少线程：`1 ≤ BLOCK_DIM ≤
   NWARP × WARPSZ` 且必须是 `WARPSZ` 的整数倍（不允许部分 warp），非法值在 start 时报
   `BAD_LAUNCH`。block 数由主机的 `GRID_DIM` 决定，`S_BID` 是当前 block 索引（只读），
-  对齐 `blockIdx`；shared/global 在 block 之间不清零。P3 的 RTL 实现多 warp、单 block，
-  `grid > 1` 在 P6。
+  对齐 `blockIdx`；shared/global 在 block 之间不清零。RTL 从 P6 起按 `GRID_DIM` 把
+  block 串行跑（P3 只做单 block）。
 - **warp 的生成与结束**：硬件有 `NWARP` 条 warp、每条 `WARPSZ` 个 lane；一次启动只激活
   前 `BLOCK_DIM / WARPSZ` 条（每条都是满 warp），其余直接 done。每条 warp 从入口
   `0x0000` 开始执行；`EXIT` 是 warp 级指令，执行到就结束整条 warp；所有活跃 warp
@@ -320,19 +320,29 @@ shared 和 global 不统一编址：指令本身决定访问哪个空间。访�
 
 ### 5.6 Kernel 调用约定
 
-主机通过 AXI-Lite 写这些寄存器，然后置 `ap_start`：
+主机通过 `s_axi_control`（AXI-Lite）写这些寄存器。前几个偏移是 Vitis RTL kernel 的
+标准控制口（`ap_ctrl_hs`），参数从 `0x10` 起（[SK_ctrl.sv](../rtl/top/SK_ctrl.sv)）：
 
 | 偏移 | 名称 | 含义 |
 |---|---|---|
-| `0x00` | `CTRL` | bit0=start，bit1=done(只读)，bit2=idle(只读)，bit3=error(只读) |
-| `0x08` | `GRID_DIM` | block 数；硬件按 block 顺序执行，kernel 用 `S_BID` 取当前索引 |
-| `0x10` | `BLOCK_DIM` | `blockDim.x`（主机写）：`1 ≤ x ≤ SK_NUM_LANES × SK_NUM_WARPS` 且是 `SK_NUM_LANES` 的整数倍；start 时校验，非法则 `STATUS = BAD_LAUNCH` |
-| `0x18/0x20/0x28` | `PTR_A/B/C` | 设备端 global 地址 |
-| `0x30/0x38/0x40` | `ARG0/1/2` | 标量参数（如 `n`） |
-| `0x48/0x50/0x58` | `IMEM_ADDR/WDATA/WE` | 指令镜像装载口 |
+| `0x00` | `CTRL` | 写 bit0=1 启动；读 bit1=done、bit2=idle、bit3=ready。写启动会清 done，忙碌时忽略 |
+| `0x04` | `GIE` | 中断使能（v0.1 没有中断，寄存器留着做兼容） |
+| `0x08` | `IER` | 同上 |
+| `0x0C` | `ISR` | 只读恒 0 |
+| `0x10` | `GRID_DIM` | block 数（≥ 1，16 位；写 0 报 `BAD_LAUNCH`）；硬件按 block 串行跑，`S_BID` 跟着变 |
+| `0x14` | `BLOCK_DIM` | `blockDim.x`：`1 ≤ x ≤ SK_NUM_LANES × SK_NUM_WARPS` 且是 `SK_NUM_LANES` 的整数倍；start 时校验，非法则 `STATUS = BAD_LAUNCH` |
+| `0x18/0x1C/0x20` | `PTR_A/B/C` | 缓冲区内的字节偏移（真正的 AXI 地址 = `GMEM_BASE` + 偏移，见下） |
+| `0x24/0x28/0x2C` | `ARG0/1/2` | 标量参数（如 `n`） |
+| `0x30/0x34` | `GMEM_BASE_LO/HI` | 缓冲区的 64 位设备地址。核里的指针是 32 位偏移，AXI 地址由 master 加上这个基址——上板时 BO 的地址可能超过 4 GB，核不装 64 位指针 |
+| `0x38/0x3C/0x40` | `IMEM_ADDR/WDATA/WE` | 指令镜像装载口：写地址 → 写数据 → 写 WE=1 落一字 |
+| `0x44` | `STATUS` | 只读错误码（§5.5 的表） |
+| `0x48` | `SHAPE` | 只读 `{NWARP[15:8], NUM_LANES[7:0]}`（先读它再决定 launch 形状，和仿真一条路） |
+| `0x4C/0x50/0x54` | `DBG_ADDR/SEL/DATA` | 调试扫描口：`SEL = {wid, lane}` 选 warp/lane，`ADDR` 就是 §13 那套扫描地址（GPR、M、谓词、PC、性能计数器） |
 
-启动顺序：主机写 IMEM 镜像 → 写参数（`GRID_DIM`/`BLOCK_DIM`/`PTR_*`/`ARG*`）→ 置
-start → 轮询 done/error。入口固定 `0x0000`。
+启动顺序：主机写 IMEM 镜像 → 写参数（`GRID_DIM`/`BLOCK_DIM`/`PTR_*`/`ARG*`/`GMEM_BASE`）
+→ 写 `CTRL.start` → 轮询 `CTRL.done`（或直接读 `STATUS`）。入口固定 `0x0000`。
+一次 launch 里 `GRID_DIM` 个 block 串行执行，性能计数器在 launch 的第一拍清零、
+之后一直累加（多 block 不会把计数器清掉）。
 
 ### 5.7 汇编示例：vecadd
 
@@ -538,6 +548,10 @@ L1/AXI，见 §8）。谁读还在等的寄存器就重发，`EXIT`/`BAR`
 出错（访存出错 / 取指越界 / `BAD_INSN` / `BAR` 不完整）就停整台核；`STATUS` 和 trap
 寄存器（停在哪条 warp 的哪个 PC）是契约，其余架构状态不作为保证（§5.5）。
 
+**重启**：`S_DONE` 也接受 `start`（P6 起），核会把 PC/`M`/谓词/寄存器堆清掉从入口重跑
+——这样主机可以在同一个 xclbin 上连着启动，`SK_ctrl` 的 `GRID_DIM` 个 block 就是靠
+这条路径串行跑的（每个 block 一次 `start`，性能计数器只在 launch 第一拍清）。
+
 历史：P1/P2 是 2 级（BRAM 取指 + 一个执行级，同拍写回），单 warp × `SK_NUM_LANES`
 个 lane；2 级在 200 MHz 下收不收敛（§12.6），拆流水线是 P3 的第一件事。lane 数取 8
 时还可以在 S3/S4 之间加一级操作数读，变成 6 级。
@@ -551,7 +565,7 @@ L1/AXI，见 §8）。谁读还在等的寄存器就重发，`EXIT`/`BAR`
 | IMEM | BRAM，16 KB | 主机通过 AXI-Lite 装载，取指只从这里 |
 | shared memory | 核内 BRAM，`SK_NUM_LANES` 个 bank，默认 32 KB | `LDS/STS`；一轮里同 bank 的 lane 复用读口，冲突分轮 replay |
 | L1 | 16 KB、直接映射、行 64 B、写回 + 写分配 | 只服务 global；`LDG/STG` 命中约 2 拍 |
-| global memory | AXI4 master（64-bit、单 outstanding）→ DDR4 | coalescer 按 64 B 行合并，miss 才走总线 |
+| global memory | AXI4 master（512-bit、单 outstanding、一次一整行）→ DDR4 | coalescer 按 64 B 行合并、L1 整行填充/逐出，每笔事务正好 64 B |
 
 访存路径（P5 起）：`SK_lsu` 预检查 → 按地址空间分流。
 
@@ -565,10 +579,15 @@ L1/AXI，见 §8）。谁读还在等的寄存器就重发，`EXIT`/`BAR`
   lane 胜；load 的数据按每条 lane 的 word 偏移回写，一拍能回写多条 lane。
   `SK_L1` 打开时行请求先进 L1：命中直接回数据；miss 先逐出脏行（写回整行）再填充
   （读整行 8 beat）。`SK_L1=0` 时 coalescer 的请求直接进 AXI master。
-- **AXI**：`SK_axi_master` 单 outstanding、INCR 突发，`RRESP/BRESP` 非 OKAY 映射成
-  `GMEM_OOB`。整台核跑完（所有 warp `EXIT`、LSU 排空）后先把 L1 的脏行 flush 回
-  内存，再拉 `done`——这样主机和 case 的内存窗口看到的是最终值。出错停机不 flush
-  （错误路径的内存状态本来就不是契约）。
+- **AXI**：`SK_axi_master` 单 outstanding。上游还是 64-bit beat 的突发接口
+  （coalescer 的组、L1 的整行），master 把它们压成 shell 的 512-bit 行事务：
+  写把 beat 按行内偏移摆进 512-bit 数据 + `WSTRB`，读把整行读回来再切片给上游；
+  地址 = `GMEM_BASE` + 32 位偏移（ISA 寄存器只有 32 位，上板时 BO 可能超过 4 GB）。
+  因为上游请求都落在同一行内，每笔 AXI 事务正好 64 B（len=0、size=6）。
+  `RRESP/BRESP` 非 OKAY 映射成 `GMEM_OOB`。整台核跑完（所有 warp `EXIT`、LSU
+  排空）后先把 L1 的脏行 flush 回内存，**等最后一笔写的事务做完**再拉 `done`——
+  这样主机和 case 的内存窗口看到的是最终值。出错停机不 flush（错误路径的内存状态
+  本来就不是契约）。
 
 对齐 + 越界在进访存之前一次查完（§5.5），所以 L1/AXI 看到的地址总是合法的；
 填充跨过容量上界的部分由 testbench 的内存模型补 64 B 填充区，不算错误。
@@ -577,11 +596,22 @@ L1/AXI，见 §8）。谁读还在等的寄存器就重发，`EXIT`/`BAR`
 
 ## 9. 主机接口（P6）
 
-GPU 顶层做成标准 Vitis RTL kernel：
+GPU 顶层做成标准 Vitis RTL kernel（`rtl/top/SK_afu.sv`）：
 
-- `s_axi_control`（AXI-Lite）：参数、start/done/error，以及 IMEM 装载口。
-- `m_axi_gmem`（AXI4）：global memory 访存。
-- 可选 `m_axi_host`：命令环 / 主机内存，v0.1 不需要。
+- `s_axi_control`（AXI-Lite）：`SK_ctrl`，寄存器表见 §5.6（参数、start/done、
+  IMEM 装载口、STATUS、调试扫描口）。
+- `m_axi_gmem`（AXI4）：global memory 访存，512-bit 单 outstanding、一次一整行；
+  地址 = `GMEM_BASE` + 核内 32 位偏移。
+- `ap_clk` / `ap_rst_n`：Vitis 约定的时钟复位。
+
+`SK_top`（`rtl/top/SK_top.sv`）= `SK_ctrl` + `SK_core` + AXI 主口，是仿真和上板共用的
+一层；`SK_afu` 只是它的上板包装（把 testbench 专用的 shared memory 主机口 tie 掉、
+接 512-bit 主口）。仿真里 `tb_top` 用 AXI-Lite 主机驱动 `SK_top`，走的就是板上的
+主机流程，所以"寄存器映射 / IMEM 装载 / start-done 握手"在本地回归里就能验。
+
+核里的指针是 32 位偏移，AXI master 把 `GMEM_BASE`（64 位设备地址）加到偏移上——上板时
+BO 的地址可能超过 4 GB，而 ISA 的寄存器只有 32 位。目前只用一块 BO，所有 `PTR_*`
+都是它内部的偏移（和 case 里用绝对偏移的写法一致，仿真里 base = 0）。
 
 所有 AXI 通道严格遵守 AXI4 握手（`valid` 不能因为 `ready` 撤销）。打包和上板步骤见
 [practice.md](practice.md) §2。
@@ -622,11 +652,11 @@ GPU 顶层做成标准 Vitis RTL kernel：
 - L1 再往上加什么：现在是阻塞式、单 MSHR、命中才省事务；多 outstanding、write
   buffer、prefetch 都留给后面按数据决定。
 - 流式写要不要免掉取行（no-fetch-on-write-miss / streaming store）：vecadd 的 C
-  数组没有任何复用，写分配把流量从 12 KB 抬到 16 KB（+33%）；20 拍往返下 L1 仍是
-  净赚（14540 vs coal 的 21086 拍），所以这是"省字节"的下一步，不是"救性能"的
-  下一步。等真有带宽敏感的流式 kernel 时再做，别为它把 L1 复杂化。
-- AXI 数据宽度：仿真和 U250 上板都先用 64-bit；上板前要按 shell 的接口宽度
-  （512-bit）加宽或在外面做位宽转换。
+  数组没有任何复用，写要先把整行取回来（写分配）再整行写回，full 配置下这块流量
+  是 64 笔事务里的 32 笔（另外 32 笔是输入行的填充）。现在它不亏（15209 拍 vs
+  coal 的 22117 拍），省的是字节不是拍数；等真有带宽敏感的流式 kernel 时再做。
+- ~~AXI 数据宽度~~（P6.2 已定）：master 直接做成 512-bit、一次一整行，不再需要
+  位宽转换——上游请求本来就都落在一条 64 B 行内，压成 len=0 的事务最省。
 
 ## 12. 关键决策
 
@@ -720,17 +750,18 @@ P2 把核按 4/8/16 lane 各综合了一遍（`make synth`：xcu250、200 MHz �
 lane 翻倍只会让每条 `LDS/STG` 更慢。所以仍然取 **4 lane**；要上 8 lane 的前提是
 先把寄存器堆做成分布式 RAM（§12.5），并且 P5 的合并器已经就位。
 
-**P5 复议（加 L1 + 合并器 + AXI master，4 lane）：**
+**P5/P6 复议（加 L1 + 合并器 + 512-bit AXI + 主机接口，4 lane）：**
 
-| LUT | FF | BRAM | URAM | DSP | WNS @200 MHz |
-|---|---|---|---|---|---|
-| 32337 | 22093 | 16 | 1 | 12 | +0.538 ns |
+| 阶段 | LUT | FF | BRAM | URAM | DSP | WNS @200 MHz |
+|---|---|---|---|---|---|---|
+| P5（64-bit master） | 32337 | 22093 | 16 | 1 | 12 | +0.538 ns |
+| P6（512-bit master + SK_ctrl） | 33156 | 22652 | 16 | 1 | 12 | +0.523 ns |
 
-新增的内存层次花了约 8K LUT、3.4K FF 和 16 个 RAMB36（16 KB 行缓存 + IMEM），
-WNS 从 P3 的 +0.43 ns 变成 +0.54 ns——合并器把"行比较 → 回写使能"这条组合路径
-拆成两级（`ROUND` 寄存分组结果、`TXN` 只依赖寄存器），所以加逻辑反而没吃掉裕量。
-面积 32.3K LUT 略超 §1 原定的 30K，P5 复议放宽到 35K；真要压回去就按 §12.5 把
-寄存器堆改成分布式 RAM。
+内存层次（L1 + 合并器 + AXI）花了约 8K LUT、3.4K FF 和 16 个 RAMB36，P6 的主机
+接口和 512-bit 打包再花 0.8K LUT / 0.6K FF；WNS 一直是 +0.5 ns 上下——合并器把
+"行比较 → 回写使能"拆成两级（`ROUND` 寄存分组结果、`TXN` 只依赖寄存器），
+所以加逻辑反而没吃掉裕量。面积 33K LUT 超过 §1 原定的 30K，P5 复议放宽到 35K；
+真要压回去就按 §12.5 把寄存器堆改成分布式 RAM。
 
 ### 12.7 内存层次分步走
 
@@ -785,37 +816,60 @@ Vitis RTL kernel + XRT 是 Xilinx 官方支持的上板路线，平台、shell �
 原始报告在 `build/m5/report.txt`。20 拍是**假设值**（DDR4 往返的量级，见 §11），
 由 tb 的 `--axi-rd-latency/--axi-wr-latency` 真正生效；上板后要用实测值替换。配置：
 
-- `base`：`SK_COALESCE=0`、`SK_L1=0`——每条 lane 一笔单 beat 事务，P4 的行为；
+- `base`：`SK_COALESCE=0`、`SK_L1=0`——每条 lane 一笔事务，P4 的行为；
 - `coal`：只开 coalescer，L1 关；
 - `full`：默认配置（coalescer + 16 KB 写回 L1）。
 
-| 用例 | 配置 | cycles | IPC | AXI rd/wr 事务 | AXI 字节 | AXI 等待拍 |
+| 用例 | 配置 | cycles | IPC | AXI rd/wr 事务 | 总线字节 | AXI 等待拍 |
 |---|---|---|---|---|---|---|
-| vecadd_stream (n=1024) | base | 76382 | 0.054 | 2048 / 1024 | 24576 | 68608 |
-| vecadd_stream (n=1024) | coal | 21086 | 0.197 | 512 / 256 | 12288 | 17920 |
-| vecadd_stream (n=1024) | full | 14540 | 0.286 | 192 / 64 | 16384 | 7488 |
-| sgemm64 | base | 1220576 | 0.571 | 8192 / 4096 | 98304 | 274433 |
-| sgemm64 | coal | 1075168 | 0.648 | 2048 / 4096 | 65536 | 141313 |
-| sgemm64 | full | 995036 | 0.700 | 768 / 256 | 65536 | 29932 |
+| vecadd_stream (n=1024) | base | 80485 | 0.052 | 2048 / 1024 | 196608 | 74752 |
+| vecadd_stream (n=1024) | coal | 22117 | 0.188 | 512 / 256 | 49152 | 19456 |
+| vecadd_stream (n=1024) | full | 15209 | 0.274 | 192 / 64 | 16384 | 8000 |
+| sgemm64 | base | 1236969 | 0.563 | 8192 / 4096 | 786432 | 299008 |
+| sgemm64 | coal | 1085417 | 0.642 | 2048 / 4096 | 393216 | 153600 |
+| sgemm64 | full | 997621 | 0.698 | 768 / 256 | 65536 | 32000 |
 
 读法：
 
+- **口径**：master 是 512-bit、一次一整行，所以**总线字节 = 事务数 × 64**。这也解释了
+  base 为什么这么亏：vecadd 每条 lane 的 4 B 读都要搬回一整行（64 B），
+  2048+1024 笔事务 = 192 KB。
 - **合并器**：连续访问（vecadd）读+写事务都正好降到 1/4；sgemm 的读也降到 1/4，
   但 C 的写是"每条 lane 一行"，四个地址跨四条 line，合并不了——写的事务数不变。
 - **L1**：把 sgemm 的写从 4096 笔降到 256 笔（每行填一次、逐出时整行写回），总事务
-  数再降 6 倍；vecadd 的工作集只有 12 KB，命中率反而没那么高（每条 line 第一次还是
-  miss），但事务数仍是 base 的 1/12。
-- **代价**：L1 省的是事务数，不是字节数——写分配要先取整行再写回，vecadd 这种没有
-  复用的流式写流量从 12 KB 抬到 16 KB（+33%）。但 20 拍往返下每笔 16 B 的直连写
-  都要吃满延迟，L1 用"每行一次填充 + 一次写回"把它换掉仍然净赚：cycles 从 coal 的
-  21086 降到 14540。要同时省掉那 33% 字节，得走 §11 的写 miss 不取行 / streaming
-  store。
+  数再降 6 倍；vecadd 的工作集只有 12 KB，命中率没那么高（每条 line 第一次还是
+  miss），但事务数仍是 base 的 1/12、总线字节 12 倍差距。
 - **结论**：合并器是"每字节成本"的改善，L1 是"延迟 + 重复访问"的改善。full 相比
-  base：vecadd 周期 76382 → 14540（5.3×），sgemm 1220576 → 995036（1.2×）；sgemm
-  的 LSU 忙 60 万拍（占六成）成了新瓶颈——所以再往上要走 §11 里"多请求槽 /
-  多 outstanding"的方向。
+  base：vecadd 周期 80485 → 15209（5.3×）、总线字节 196608 → 16384（12×）；sgemm
+  1236969 → 997621（1.24×）、总线字节 786432 → 65536（也是 12×）。sgemm 的 LSU
+  忙 60 万拍（占六成）成了新瓶颈——所以再往上要走 §11 里"多请求槽 / 多 outstanding /
+  写回 L1 不写分配"的方向（写分配现在只占字节的一小部分，收益主要在前两者）。
 
 复现：`make m5`（三种配置各编一份 Verilator 模型，几秒钟）。
+
+### 12.12 上板实测（P6）
+
+U250 板卡（shell 4.1 + XRT 2.21.75），用的 bitstream 是
+`build/u250_150/skein.xclbin`：**150 MHz、CU 钉 SLR2、数据走 `DDR[1]`**。
+这是唯一把布线跑通的一条——同样的配置在 200 MHz（不钉 SLR / SLR0 / SLR2 / SLR3
+四条）全部 `Kernel link failed to complete`；150 MHz 这条 1h39m 链完，
+布线后时序 WNS **+0.012 ns**、WHS **+0.010 ns**（时序收敛）。原因见 practice.md §2.4。
+
+| 测试 | 结果 | cycles | retired | 说明 |
+|---|---|---|---|---|
+| smoke（寄存器读写 + SHAPE） | PASS | — | — | SHAPE 读回 `0x0404`（4 lane × 4 warp） |
+| vecadd n=1024（`cases/bench/vecadd_stream`） | PASS | 20474 | 4160 | 1024 个结果与主机参考逐位一致 |
+| sgemm64（`cases/bench/sgemm64`） | PASS | 1016740 | 696616 | 4096 个输出全对（shared + BAR） |
+
+读法：
+
+- 板上 cycles 比 §12.11 的仿真值高（vecadd 20474 vs 15209、sgemm 1016740 vs 997621）：
+  150 MHz 时钟 + 真实 DDR4 往返延迟（仿真里固定 20 拍，真机远大于此），而核是
+  "阻塞式单请求"结构，延迟直接变成周期。正确性不受影响。
+- sgemm 的 IPC ≈ 0.685（696616 / 1016740），和仿真 full 配置的 0.698 基本一致，
+  说明仿真里"瓶颈在 LSU/DRAM 延迟"的结论可信。
+- 上板前必须让卡跑在 **xdma shell** 上（flash 里装的是 base 平台），步骤见
+  practice.md §2.6；shell 是**易失**的，重载驱动/重启后会回到 base，要重装一次。
 
 ## 13. 性能计数器
 
@@ -827,7 +881,7 @@ Vitis RTL kernel + XRT 是 Xilinx 官方支持的上板路线，平台、shell �
 | 周期/发射 | `CYCLE`、`INST_ISSUED`、`INST_RETIRED`、`REPLAY`、`BARRIERS` | IPC = `INST_RETIRED / CYCLE`；M3 用同一个 kernel 跑 `NWARP = 1/2/4` 各一遍画曲线 |
 | 停顿 | `STALL_NO_WARP`、`LSU_BUSY` | 外加读的时候算的 `CYCLE - INST_ISSUED`（总共几拍没发射）：判断 IPC 低是缺 warp 还是访存没排空 |
 | shared | `LDS_TXN`、`STS_TXN`、`LDS_REPLAY` | 一条 `LDS/STS` 算一笔；`LDS_REPLAY` 数 load 因为 bank 冲突多花的轮数 |
-| global/AXI | `AXI_RD_TXN`、`AXI_WR_TXN`、`AXI_RD_BEATS`、`AXI_WR_BEATS`、`AXI_STALL` | M5 的对比表（§12.11）；字节数 = beat × 8，读的时候现算 |
+| global/AXI | `AXI_RD_TXN`、`AXI_WR_TXN`、`AXI_RD_BEATS`、`AXI_WR_BEATS`、`AXI_STALL` | M5 的对比表（§12.11）。事务 = AXI 突发（现在恒为一整行 64 B）；beat = 核侧搬的 8 字节块（`beats × 8` 是核侧字节）；总线字节 = 事务 × 64 |
 | L1 | `L1_RD_HIT`、`L1_RD_MISS`、`L1_WR_HIT`、`L1_WR_MISS`、`L1_WB` | 命中率和脏行写回的代价 |
 | 指令分类 | `INST_RETIRED[class]` × 15 类 | 和黄金模型的 `op_counts` 逐类对拍，指令 mix 错了立刻能看出来 |
 
@@ -835,11 +889,11 @@ Vitis RTL kernel + XRT 是 Xilinx 官方支持的上板路线，平台、shell �
   `op_counts`）；`skein-case` 拿 `INST_RETIRED` 的总数和黄金模型的 `steps` 对拍——
   对不上就是 RTL 的 bug，这比"结果正确"更早暴露吞吐问题。P5 起还逐类对拍
   `INST_RETIRED[class]` 和 `op_counts`。
-- RTL 侧：`SK_perf.sv` 放一组 32 位计数器，各流水级给 one-hot 事件；`CTRL.start`
-  清零、`done` 之后自然冻结。200 MHz 下 32 位要 20 s 才回绕，够用。
-- 读出口：走调试扫描口（`0x30-0x43` 是通用计数器、`0x44-0x52` 是指令分类，
-  `tb_core` 把它们 dump 进 case 的 `perf`），P6 换成 AXI-Lite 的
-  `PERF_ADDR`/`PERF_DATA` 一对寄存器。
+- RTL 侧：`SK_perf.sv` 放一组 32 位计数器，各流水级给 one-hot 事件；一次 launch 的
+  第一拍清零（多 block 只在开头清一次）、`done` 之后自然冻结。200 MHz 下 32 位要
+  20 s 才回绕，够用。
+- 读出口就是 §5.6 的调试扫描口：`0x30-0x43` 是通用计数器、`0x44-0x52` 是指令分类，
+  `tb_core` 和上板主机都用它读。
 - "没发射"只记两个量：总数用 `CYCLE - INST_ISSUED` 现算（不占计数器），
   `STALL_NO_WARP` 数"一条 RUN 状态的 warp 都没有"（都在 BAR 上等 / 已经 EXIT）。
   更细的"在等 load 数据 / 等访存槽 / 指令还没走完"不做了：同一拍几条 warp 各有各的
