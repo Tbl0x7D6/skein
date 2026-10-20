@@ -37,6 +37,8 @@ pub struct Spec {
     pub max_steps: Option<u64>,
     /// RTL 的时钟上限（默认 testbench 自己的 200000，bench 用例要放大）
     pub max_cycles: Option<u64>,
+    /// 设备地址基址（上板时是 BO 的地址，可能 > 4 GB）；默认 0 = 核内偏移当绝对地址
+    pub gmem_base: Option<u64>,
     /// 主机写的特殊寄存器（PTR_A/PTR_B/PTR_C/ARG0/ARG1/ARG2）
     #[serde(default)]
     pub sreg: BTreeMap<String, u32>,
@@ -307,14 +309,23 @@ impl Case {
             ));
         }
         let block_dim = self.block_dim();
-        if block_dim == 0 || block_dim % shape.warpsz != 0 {
-            return Err(format!("block_dim = {block_dim} 不是 warpsz 的整数倍"));
-        }
-        if block_dim > shape.max_block_dim {
-            return Err(format!(
-                "block_dim = {block_dim}，RTL 一个 block 最多 {} 个线程",
-                shape.max_block_dim
-            ));
+        // 非法 launch 参数（0 / 不是整数倍 / 超容量）本来就要报 BAD_LAUNCH，
+        // 这种 case 照样送进 RTL——launch 校验走的就是板上主机写寄存器那条路
+        let expect_bad_launch = self
+            .spec
+            .expect
+            .as_ref()
+            .is_some_and(|expect| expect.status.as_deref() == Some("BAD_LAUNCH"));
+        if !expect_bad_launch {
+            if block_dim == 0 || block_dim % shape.warpsz != 0 {
+                return Err(format!("block_dim = {block_dim} 不是 warpsz 的整数倍"));
+            }
+            if block_dim > shape.max_block_dim {
+                return Err(format!(
+                    "block_dim = {block_dim}，RTL 一个 block 最多 {} 个线程",
+                    shape.max_block_dim
+                ));
+            }
         }
         if self.spec.nwarp > shape.nwarp {
             return Err(format!(
@@ -324,8 +335,8 @@ impl Case {
         }
         if self.spec.grid > shape.max_grid {
             return Err(format!(
-                "grid = {}，RTL 还是单 block（多 block 在 P6）",
-                self.spec.grid
+                "grid = {}，RTL 一次最多 {} 个 block",
+                self.spec.grid, shape.max_grid
             ));
         }
         Ok(())
@@ -343,6 +354,12 @@ impl Case {
         args.push(format!("{}", self.block_dim()));
         args.push("--nwarp".to_string());
         args.push(format!("{}", self.spec.nwarp));
+        args.push("--grid".to_string());
+        args.push(format!("{}", self.spec.grid));
+        if let Some(base) = self.spec.gmem_base {
+            args.push("--gmem-base".to_string());
+            args.push(format!("{base:#x}"));
+        }
         if let Some(cycles) = self.spec.max_cycles {
             args.push("--max-cycles".to_string());
             args.push(format!("{cycles}"));

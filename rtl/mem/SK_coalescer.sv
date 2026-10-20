@@ -18,7 +18,7 @@ module SK_coalescer #(
     parameter int  LANES   = 4,
     parameter int  ENABLE  = `SK_COALESCE,
     parameter int  ADDR_W  = 32,
-    parameter int  LEN_W   = 4
+    parameter int  LEN_W   = 3            // 一行最多 8 个 beat，长度 - 1 只要 3 位
 ) (
     input  logic                      clk,
     input  logic                      aresetn,

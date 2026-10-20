@@ -1,0 +1,17 @@
+# 定向：grid = 2（多 block 串行，S_BID 生效）
+program = "grid2.s"
+warpsz = 4
+nwarp = 4
+block_dim = 4
+grid = 2
+
+[sreg]
+PTR_C = 0x3000
+
+[[check]]
+space = "gmem"
+addr = 0x3000
+words = 8
+
+[expect]
+status = "OK"

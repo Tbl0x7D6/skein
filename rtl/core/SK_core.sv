@@ -36,6 +36,9 @@ module SK_core #(
     input  logic                              clk,
     input  logic                              aresetn,        // 同步复位，低有效
     input  logic                              start_i,        // 启动脉冲（P6 接 CTRL.start）
+    // 计数器清零：一次 launch 的第一拍（GRID_DIM 个 block 只清一次）。P6 之前
+    // 每个 block 都是一次 launch，所以和 start_i 一样。
+    input  logic                              perf_clear_i,
     // 特殊寄存器（P3 由 testbench 驱动；P6 接 AXI-Lite 控制寄存器）
     input  logic [31:0]                       sreg_i [16],
     // 核的容量：{NWARP, NUM_LANES}；testbench 用它决定 dump 形状（P6 接成只读寄存器）
@@ -51,28 +54,29 @@ module SK_core #(
     input  logic [SMEM_W-1:0]                 smem_rd_addr_i,   // 字地址
     input  logic                              smem_rd_en_i,
     output logic [31:0]                       smem_rd_data_o,
-    // global memory：AXI4 主口（64-bit、单 outstanding；P6 接 Vitis shell）
-    output logic [31:0]                       m_axi_awaddr_o,
+    // global memory：AXI4 主口（512-bit 行事务、单 outstanding；接 Vitis shell）
+    input  logic [63:0]                       gmem_base_i,     // 设备地址基址（SK_ctrl 写）
+    output logic [63:0]                       m_axi_awaddr_o,
     output logic [7:0]                        m_axi_awlen_o,
     output logic [2:0]                        m_axi_awsize_o,
     output logic [1:0]                        m_axi_awburst_o,
     output logic                              m_axi_awvalid_o,
     input  logic                              m_axi_awready_i,
-    output logic [63:0]                       m_axi_wdata_o,
-    output logic [7:0]                        m_axi_wstrb_o,
+    output logic [511:0]                      m_axi_wdata_o,
+    output logic [63:0]                       m_axi_wstrb_o,
     output logic                              m_axi_wlast_o,
     output logic                              m_axi_wvalid_o,
     input  logic                              m_axi_wready_i,
     input  logic [1:0]                        m_axi_bresp_i,
     input  logic                              m_axi_bvalid_i,
     output logic                              m_axi_bready_o,
-    output logic [31:0]                       m_axi_araddr_o,
+    output logic [63:0]                       m_axi_araddr_o,
     output logic [7:0]                        m_axi_arlen_o,
     output logic [2:0]                        m_axi_arsize_o,
     output logic [1:0]                        m_axi_arburst_o,
     output logic                              m_axi_arvalid_o,
     input  logic                              m_axi_arready_i,
-    input  logic [63:0]                       m_axi_rdata_i,
+    input  logic [511:0]                      m_axi_rdata_i,
     input  logic [1:0]                        m_axi_rresp_i,
     input  logic                              m_axi_rlast_i,
     input  logic                              m_axi_rvalid_i,
@@ -124,7 +128,9 @@ module SK_core #(
     assign active_warps = ((block_dim >> WARPSZ_SHIFT) > 32'(NUM_WARPS))
                         ? (WARP_W+1)'(NUM_WARPS) : (WARP_W+1)'(block_dim >> WARPSZ_SHIFT);
 
-    assign start_pulse = (state_q == S_IDLE) && start_i;
+    // S_DONE 也接受 start：主机可以连着跑多次（多 block、或者同一个 xclbin 里
+    // 连续启动），核在这里把上一次的架构状态整个重置掉。
+    assign start_pulse = ((state_q == S_IDLE) || (state_q == S_DONE)) && start_i;
     assign shape_o     = {8'(NUM_WARPS), 8'(NUM_LANES)};
 
     // --- 调度 ---
@@ -639,7 +645,7 @@ module SK_core #(
     // coalescer 的下游（接 L1 上游）
     logic        c2l_valid, c2l_ready, c2l_we;
     logic [31:3] c2l_addr;
-    logic [3:0]  c2l_len;
+    logic [2:0]  c2l_len;
     logic [63:0] c2l_wdata;
     logic [7:0]  c2l_wstrb;
     logic        c2l_wbeat_taken, c2l_rvalid, c2l_rlast, c2l_rready;
@@ -647,8 +653,8 @@ module SK_core #(
     logic        c2l_done, c2l_fault;
     // L1 的下游（接 AXI master）
     logic        l2a_valid, l2a_ready, l2a_we;
-    logic [31:0] l2a_addr;
-    logic [3:0]  l2a_len;
+    logic [31:3] l2a_addr;
+    logic [2:0]  l2a_len;
     logic [63:0] l2a_wdata;
     logic [7:0]  l2a_wstrb;
     logic        l2a_wbeat_taken, l2a_rvalid, l2a_rlast, l2a_rready;
@@ -713,7 +719,7 @@ module SK_core #(
         .dn_valid_o      (l2a_valid),
         .dn_ready_i      (l2a_ready),
         .dn_we_o         (l2a_we),
-        .dn_addr_o       (l2a_addr),
+        .dn_addr_o       ({l2a_addr, 3'b000}),
         .dn_len_o        (l2a_len),
         .dn_wdata_o      (l2a_wdata),
         .dn_wstrb_o      (l2a_wstrb),
@@ -734,6 +740,7 @@ module SK_core #(
     SK_axi_master #() u_axi (
         .clk             (clk),
         .aresetn         (aresetn),
+        .base_i          (gmem_base_i),
         .req_valid_i     (l2a_valid),
         .req_ready_o     (l2a_ready),
         .req_we_i        (l2a_we),
@@ -841,7 +848,7 @@ module SK_core #(
     SK_perf u_perf (
         .clk            (clk),
         .aresetn        (aresetn),
-        .start_i        (start_pulse),
+        .start_i        (perf_clear_i),
         // flush 也是这次 block 的一部分（脏行写回），一起计
         .run_i          ((state_q == S_RUN) || (state_q == S_FLUSH)),
         .issued_i       (issue_valid),
@@ -893,7 +900,7 @@ module SK_core #(
             end
         end else begin
             case (state_q)
-                S_IDLE: begin
+                S_IDLE, S_DONE: begin
                     if (start_i) begin
                         trap_valid_q <= 1'b0;
                         // 调度器的"在途/等排空"标志也一起清：留下 stale 的 busy 位，
@@ -1065,7 +1072,6 @@ module SK_core #(
                 S_FLUSH: begin
                     if (l1_flush_done) state_q <= S_DONE;
                 end
-                default: ;                             // S_DONE：保持
             endcase
         end
     end

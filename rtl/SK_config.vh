@@ -45,7 +45,7 @@
 `define SK_MEM_LINE_BYTES 64   // cache line / coalescer 合并粒度
 `endif
 `ifndef SK_AXI_DATA_W
-`define SK_AXI_DATA_W   64     // AXI4 数据宽度（bit）
+`define SK_AXI_DATA_W   512    // AXI4 数据宽度（bit）：一行 64 B，上板对齐 shell
 `endif
 
 `endif

@@ -7,8 +7,8 @@ K      ?=
 VIVADO ?= $(firstword $(wildcard /tools/Xilinx/Vivado/*/bin/vivado) vivado)
 SYN_LANES ?= 4 8 16
 KERNEL := $(basename $(notdir $(SRC)))
-RTL_SRCS := rtl/SK_pkg.sv $(wildcard rtl/lib/*.sv rtl/core/*.sv rtl/mem/*.sv rtl/sched/*.sv rtl/perf/*.sv)
-TB_SRCS  := tb/tb_top.sv tb/tb_axi_mem.sv
+RTL_SRCS := rtl/SK_pkg.sv $(wildcard rtl/lib/*.sv rtl/core/*.sv rtl/mem/*.sv rtl/sched/*.sv rtl/perf/*.sv rtl/top/*.sv)
+TB_SRCS  := tb/tb_top.sv tb/tb_axi_mem.sv tb/tb_axil_host.sv
 RTL_TOP  ?= SK_core
 TB_TOP   ?= tb_top
 RTL_TB   := $(BUILD)/obj_core/tb_core
@@ -54,6 +54,7 @@ lint:
 rtl-lint:
 	verilator --lint-only -Wall --top-module $(RTL_TOP) -Irtl $(RTL_SRCS)
 	verilator --lint-only -Wall --top-module $(TB_TOP) -Irtl -Itb $(RTL_SRCS) $(TB_SRCS)
+	verilator --lint-only -Wall --top-module SK_afu -Irtl $(RTL_SRCS)
 
 $(RTL_TB): $(RTL_SRCS) $(TB_SRCS) tb/tb_core.cpp | $(BUILD)
 	verilator --cc --exe --build -j 4 -Wall --top-module $(TB_TOP) -Irtl -Itb \

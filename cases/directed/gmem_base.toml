@@ -1,0 +1,14 @@
+# 定向：GMEM_BASE 非 0（> 4 GB）——核里的 32 位偏移加上 64 位设备基址才是 AXI 地址。
+# 程序就是 mem.s：它的全局读写落在偏移 0x1000/0x100C 附近，基址取 0x1_2345_0000，
+# 基址加错（或者只加低 32 位）就会 DECERR → GMEM_OOB 或者读回错值。
+program = "mem.s"
+warpsz = 4
+nwarp = 1
+block_dim = 4
+gmem_base = 0x123450000
+
+[sreg]
+PTR_A = 0x1000
+
+[expect]
+status = "OK"

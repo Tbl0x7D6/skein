@@ -15,6 +15,9 @@ module tb_axi_mem #(
     input  logic                aresetn,
     input  logic [7:0]          rd_lat_i,
     input  logic [7:0]          wr_lat_i,
+    // 从机自己的地址空间基址：AXI 地址 = addr_base_i + 偏移（和板上 BO 一样）。
+    // 主机口还是偏移地址，等于主机直接访问那块 BO。
+    input  logic [ADDR_W-1:0]   addr_base_i,
     // AXI4 从口
     input  logic [ADDR_W-1:0]   s_awaddr_i,
     input  logic [7:0]          s_awlen_i,
@@ -50,6 +53,9 @@ module tb_axi_mem #(
 );
 
     localparam int STRB_W = DATA_W / 8;
+    // 端口地址是 64 位（上板时核的地址要加基址），这里的内存只有 BYTES 大小：
+    // 越界由 *_in_range 判，真正访问内存的索引先截到 IDX_W 位。
+    localparam int IDX_W = $clog2(BYTES);
     localparam logic [1:0] AXI_INCR = 2'b01;
 
     logic [7:0] mem [BYTES];
@@ -59,15 +65,21 @@ module tb_axi_mem #(
     assign wr_stride = ADDR_W'(1) << s_awsize_i;
 
     // --- 主机口：组合读、整字写 ---
-    assign host_rdata_o = {mem[host_raddr_i + 3], mem[host_raddr_i + 2],
-                           mem[host_raddr_i + 1], mem[host_raddr_i]};
+    logic host_rd_ok, host_wr_ok;
+    assign host_rd_ok = (host_raddr_i + ADDR_W'(4)) <= ADDR_W'(BYTES);
+    assign host_wr_ok = (host_addr_i + ADDR_W'(4)) <= ADDR_W'(BYTES);
+    assign host_rdata_o = !host_rd_ok ? '0 :
+                          {mem[host_raddr_i[IDX_W-1:0] + IDX_W'(3)],
+                           mem[host_raddr_i[IDX_W-1:0] + IDX_W'(2)],
+                           mem[host_raddr_i[IDX_W-1:0] + IDX_W'(1)],
+                           mem[host_raddr_i[IDX_W-1:0]]};
 
     always_ff @(posedge clk) begin
-        if (host_we_i) begin
-            mem[host_addr_i]     <= host_wdata_i[7:0];
-            mem[host_addr_i + 1] <= host_wdata_i[15:8];
-            mem[host_addr_i + 2] <= host_wdata_i[23:16];
-            mem[host_addr_i + 3] <= host_wdata_i[31:24];
+        if (host_we_i && host_wr_ok) begin
+            mem[host_addr_i[IDX_W-1:0]]     <= host_wdata_i[7:0];
+            mem[host_addr_i[IDX_W-1:0] + IDX_W'(1)] <= host_wdata_i[15:8];
+            mem[host_addr_i[IDX_W-1:0] + IDX_W'(2)] <= host_wdata_i[23:16];
+            mem[host_addr_i[IDX_W-1:0] + IDX_W'(3)] <= host_wdata_i[31:24];
         end
     end
 
@@ -113,10 +125,13 @@ module tb_axi_mem #(
     end
 
     logic [ADDR_W-1:0] rd_beat_addr;
+    logic [ADDR_W-1:0] rd_off;
     logic              rd_in_range;
 
     assign rd_beat_addr = rd_addr_q + ADDR_W'(rd_beat_q) * rd_stride;
-    assign rd_in_range  = (rd_beat_addr + (DATA_W / 8)) <= ADDR_W'(BYTES);
+    assign rd_off        = rd_beat_addr - addr_base_i;
+    assign rd_in_range  = (rd_beat_addr >= addr_base_i) &&
+                          ((rd_off + ADDR_W'(STRB_W)) <= ADDR_W'(BYTES));
 
     always_comb begin
         s_rvalid_o = (rd_q == RD_BEAT);
@@ -125,7 +140,7 @@ module tb_axi_mem #(
         s_rdata_o  = '0;
         if (rd_in_range) begin
             for (int b = 0; b < STRB_W; b++) begin
-                s_rdata_o[b*8 +: 8] = mem[rd_beat_addr + b];
+                s_rdata_o[b*8 +: 8] = mem[rd_off[IDX_W-1:0] + IDX_W'(b)];
             end
         end
     end
@@ -145,10 +160,13 @@ module tb_axi_mem #(
     assign s_bresp_o   = wr_err_q ? 2'b10 : 2'b00;
 
     logic [ADDR_W-1:0] wr_beat_addr;
+    logic [ADDR_W-1:0] wr_off;
     logic              wr_in_range;
 
     assign wr_beat_addr = wr_addr_q + ADDR_W'(wr_beat_q) * wr_stride;
-    assign wr_in_range  = (wr_beat_addr + (DATA_W / 8)) <= ADDR_W'(BYTES);
+    assign wr_off        = wr_beat_addr - addr_base_i;
+    assign wr_in_range  = (wr_beat_addr >= addr_base_i) &&
+                          ((wr_off + ADDR_W'(STRB_W)) <= ADDR_W'(BYTES));
 
     always_ff @(posedge clk) begin
         if (!aresetn) begin
@@ -194,7 +212,7 @@ module tb_axi_mem #(
     always_ff @(posedge clk) begin
         if ((wr_q == WR_BEAT) && s_wvalid_i && wr_in_range) begin
             for (int b = 0; b < STRB_W; b++) begin
-                if (s_wstrb_i[b]) mem[wr_beat_addr + b] <= s_wdata_i[b*8 +: 8];
+                if (s_wstrb_i[b]) mem[wr_off[IDX_W-1:0] + IDX_W'(b)] <= s_wdata_i[b*8 +: 8];
             end
         end
     end

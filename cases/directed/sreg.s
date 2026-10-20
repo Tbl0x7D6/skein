@@ -4,7 +4,7 @@
         SREAD   r2, S_LANEID            ; 0,1,2,3
         SREAD   r3, S_WID               ; 0
         SREAD   r4, S_WARPSZ            ; 4
-        SREAD   r5, S_NWARP             ; 1
+        SREAD   r5, S_NWARP             ; 4（硬件容量）
         SREAD   r6, S_GRID              ; 1
         SREAD   r7, S_BID               ; 0
         SREAD   r8, S_BLOCK_DIM         ; 4

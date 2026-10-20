@@ -1,7 +1,7 @@
 # 定向：特殊寄存器、VOTE、SHFL、NOP/BAR（单 warp × 4 lane）
 program = "sreg.s"
 warpsz = 4
-nwarp = 1
+nwarp = 4
 block_dim = 4
 
 [sreg]

@@ -1,0 +1,8 @@
+# 错误：BLOCK_DIM = 0 → BAD_LAUNCH（launch 校验是主机写寄存器那条路的一部分）
+program = "bad_launch.s"
+warpsz = 4
+nwarp = 4
+block_dim = 0
+
+[expect]
+status = "BAD_LAUNCH"

@@ -30,7 +30,7 @@ module SK_l1_cache #(
     output logic               up_ready_o,
     input  logic               up_we_i,
     input  logic [ADDR_W-1:3]  up_addr_i,      // beat 对齐，低 3 位恒 0
-    input  logic [3:0]         up_len_i,
+    input  logic [2:0]         up_len_i,
     input  logic [63:0]        up_wdata_i,
     input  logic [7:0]         up_wstrb_i,
     output logic               up_wbeat_taken_o,
@@ -45,7 +45,7 @@ module SK_l1_cache #(
     input  logic               dn_ready_i,
     output logic               dn_we_o,
     output logic [ADDR_W-1:0]  dn_addr_o,
-    output logic [3:0]         dn_len_o,
+    output logic [2:0]         dn_len_o,
     output logic [63:0]        dn_wdata_o,
     output logic [7:0]         dn_wstrb_o,
     input  logic               dn_wbeat_taken_i,
@@ -114,7 +114,7 @@ module SK_l1_cache #(
 
     // 当前请求
     logic              we_q;
-    logic [3:0]        len_q;
+    logic [2:0]        len_q;
     logic [ADDR_W-1:6] line_addr_q;
     logic [IDX_W-1:0]  idx_q;
     logic [TAG_W-1:0]  req_tag_q, victim_tag_q;
@@ -130,6 +130,7 @@ module SK_l1_cache #(
     logic [3:0] wcnt_q, rcnt_q, fcnt_q;
     logic [IDX_W-1:0] flush_idx_q;
     logic       flush_active_q, flush_done_q;
+    logic       flush_beats_done_q;      // 本行 beat 交完了，等下游事务真正做完
     logic       fault_q;
 
     // --- 数据 RAM：一个读口 + 一个整行写口（走 SK_dp_ram 模板，保证落进 BRAM）---
@@ -155,7 +156,7 @@ module SK_l1_cache #(
         if (we_q) begin
             for (int b = 0; b < BEATS; b++) begin
                 // 只有前 len+1 拍是这条请求写的，wbuf 其它拍是上一条请求留下的
-                if (3'(b) <= len_q[2:0]) begin
+                if (3'(b) <= len_q) begin
                     for (int bi = 0; bi < 8; bi++) begin
                         // off = (line 内 beat) * 8 + beat 内字节偏移
                         automatic logic [5:0] off = {first_beat_q + 3'(b), 3'(bi)};
@@ -206,7 +207,7 @@ module SK_l1_cache #(
 
     always_comb begin
         up_rvalid_o = (state_q == ST_RESP);
-        up_rlast_o  = (state_q == ST_RESP) && (rcnt_q == len_q);
+        up_rlast_o  = (state_q == ST_RESP) && (rcnt_q[2:0] == len_q);
         up_rdata_o  = {line_q[rsp_beat*2 + 1], line_q[rsp_beat*2]};
     end
 
@@ -226,7 +227,7 @@ module SK_l1_cache #(
                       ? {tag_q[flush_idx_q], flush_idx_q, 6'b0}
                       : (dn_is_wb ? {victim_tag_q, idx_q, 6'b0}
                                   : {line_addr_q, 6'b0});
-    assign dn_len_o   = 4'(BEATS - 1);
+    assign dn_len_o   = 3'(BEATS - 1);
 
     always_comb begin
         dn_wdata_o = '0;
@@ -271,7 +272,7 @@ module SK_l1_cache #(
 
     assign up_done_o  = ((state_q == ST_WRITE_LINE) && we_q)
                      || ((state_q == ST_RESP) && up_rvalid_o && up_rready_i
-                         && (rcnt_q == len_q));
+                         && (rcnt_q[2:0] == len_q));
     assign up_fault_o = fault_q;
     assign flush_busy_o = flush_active_q;
     assign flush_done_o = flush_done_q;
@@ -293,6 +294,7 @@ module SK_l1_cache #(
             flush_idx_q    <= '0;
             flush_active_q <= 1'b0;
             flush_done_q   <= 1'b0;
+            flush_beats_done_q <= 1'b0;
             fault_q        <= 1'b0;
         end else begin
             flush_done_q <= 1'b0;
@@ -319,7 +321,7 @@ module SK_l1_cache #(
                 ST_WR_BEATS: begin
                     wbuf_q[wcnt_q[2:0]]  <= up_wdata_i;
                     wstrb_q[wcnt_q[2:0]] <= up_wstrb_i;
-                    if (wcnt_q == len_q) state_q <= ST_LOOKUP;
+                    if (wcnt_q[2:0] == len_q) state_q <= ST_LOOKUP;
                     else                 wcnt_q <= wcnt_q + 4'd1;
                 end
                 ST_LOOKUP: begin
@@ -352,7 +354,7 @@ module SK_l1_cache #(
                 end
                 ST_RESP: begin
                     if (up_rvalid_o && up_rready_i) begin
-                        if (rcnt_q == len_q) state_q <= ST_IDLE;
+                        if (rcnt_q[2:0] == len_q) state_q <= ST_IDLE;
                         else                 rcnt_q <= rcnt_q + 4'd1;
                     end
                 end
@@ -373,7 +375,16 @@ module SK_l1_cache #(
                 end
                 ST_FLUSH_REQ: if (dn_ready_i) state_q <= ST_FLUSH_WR;
                 ST_FLUSH_WR: begin
+                    // 关键：要等下游事务做完（dn_done_i，写完收到 B），不能只看
+                    // beat 交完——新的 AXI master 会先把整行攒起来再发总线，
+                    // beat 交完时写还在它的缓冲里。早报 done 的话，主机可能在
+                    // 最后一笔写回落到内存之前就读 BO。
                     if (dn_wbeat_taken_i && (dn_beat == 3'(BEATS - 1))) begin
+                        flush_beats_done_q <= 1'b1;
+                    end
+                    if ((flush_beats_done_q ||
+                         (dn_wbeat_taken_i && (dn_beat == 3'(BEATS - 1)))) && dn_done_i) begin
+                        flush_beats_done_q <= 1'b0;
                         if (flush_idx_q == IDX_W'(SETS - 1)) begin
                             flush_active_q <= 1'b0;
                             flush_done_q   <= 1'b1;

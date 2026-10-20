@@ -282,6 +282,18 @@ fn block_dim_rejects_bad_launch() {
 }
 
 #[test]
+fn grid_zero_is_bad_launch() {
+    // GRID_DIM 至少要 1 个 block（RTL 的 SK_ctrl 也是这么校验的）
+    let config = Config {
+        grid: 0,
+        ..one_warp()
+    };
+    let machine = run_with("EXIT", config);
+    assert_eq!(machine.status, Status::BadLaunch);
+    assert_eq!(machine.steps, 0);
+}
+
+#[test]
 fn grid_runs_blocks_in_order() {
     // grid > 1：每个 block 从头跑一遍，S_BID 是当前 block 索引
     let config = Config {

@@ -1,26 +1,29 @@
-//! Verilator testbench（顶层是 tb_top：SK_core + AXI 从机内存模型）。
+//! Verilator testbench（顶层是 tb_top：AXI-Lite 主机 + SK_top + AXI 从机内存模型）。
 //!
 //! 这里不做比对——`skein-case`（tools/src/bin/skein-case.rs）把这份 dump 和黄金模型逐项
 //! 比对。testbench 只负责：装载 IMEM 镜像和 shared/global 初态、驱动特殊寄存器、
 //! 跑到 done 或者报错，然后按 --mem-window 把架构状态、性能计数器和内存窗口写成 JSON，
 //! 字段和 `skein-run --dump-state` 对齐（多一个 "mem"、"perf" 和 "fault"）。
 //!
-//! global memory 走核的 AXI4 主口，由 tb_axi_mem.sv 应答；主机侧通过它的 host 口
-//! 装初态、读回比对窗口。shared memory 在核内，通过核的主机口装初态 / 读快照。
+//! 和板上一致的主机流程：IMEM 镜像、参数、start 全部走 AXI-Lite 控制寄存器（`SK_ctrl`），
+//! done/STATUS 也从控制寄存器轮询；架构状态和性能计数器从调试扫描口读。
+//! global memory 走核的 AXI4 主口，由 tb_axi_mem.sv 应答，主机侧通过它的 host 口装初态、
+//! 读回比对窗口；shared memory 在核内，用 testbench 专用口装初态 / 读快照。
 //!
 //! 用法：
-//!   tb_core --image <image.bin> [--bdim N] [--nwarp N] [--set NAME=VALUE]...
+//!   tb_core --image <image.bin> [--bdim N] [--grid N] [--nwarp N] [--set NAME=VALUE]...
 //!           [--gmem-init ADDR FILE]... [--smem-init ADDR FILE]...
 //!           [--mem-window SPACE ADDR WORDS]... [--max-cycles N] [--trace]
 //!           [--axi-rd-latency N] [--axi-wr-latency N]
 //!           [--dump-state <file>] [--dump-wave <file.fst>]
 //!   tb_core --print-shape                      # 只打印核的形状，不跑
 //!
-//! 形状来自核的 `shape_o`：warp 大小 `SK_NUM_LANES`、warp 数 `SK_NUM_WARPS`。
+//! 形状来自控制寄存器的 SHAPE（就是核的 `shape_o`）：warp 大小 `SK_NUM_LANES`、
+//! warp 数 `SK_NUM_WARPS`；`max_grid` 是 GRID_DIM 字段的宽度（多 block 串行跑）。
 //! `skein-case` 先用 `--print-shape` 探形状，超过这个形状的 case 报 SKIP。
-//! `WARPSZ`/`GRID`/`BID` 由这里驱动，`NWARP` 默认报硬件容量、也可以用 `--nwarp` 改
-//! （case 模拟的机器更小的时候）；`BLOCK_DIM` 默认用满容量、也可以用 `--bdim` 给小
-//! 一点的 block。`TID/LANEID/WID` 由核按 warp 和 lane 算。
+//! `NWARP`/`WARPSZ` 固定报硬件容量；`--nwarp` 只决定 dump 几条 warp（黄金模型是更小
+//! 的机器时，多出来的 warp 不用比），`--bdim` 给 block 线程数、`--grid` 给 block 数。
+//! `TID/LANEID/WID/BID` 由硬件按启动参数算。
 //!
 //! `--dump-wave` 要带波形支持的模型（`make tb-trace` 出来的 `tb_core_trace`），普通
 //! 模型的时序逻辑不带 trace 代码，用它会直接报错。
@@ -106,6 +109,27 @@ constexpr int SREG_BLOCK_DIM = 0x0E;
 constexpr int NUM_GPR = 32;
 constexpr int NUM_PRED = 8;
 
+/// AXI-Lite 控制寄存器偏移，和 rtl/top/SK_ctrl.sv / docs/design.md §5.6 一致。
+constexpr uint32_t REG_CTRL = 0x000;
+constexpr uint32_t REG_GRID = 0x010;
+constexpr uint32_t REG_BLOCK_DIM = 0x014;
+constexpr uint32_t REG_PTR_A = 0x018;
+constexpr uint32_t REG_PTR_B = 0x01C;
+constexpr uint32_t REG_PTR_C = 0x020;
+constexpr uint32_t REG_ARG0 = 0x024;
+constexpr uint32_t REG_ARG1 = 0x028;
+constexpr uint32_t REG_ARG2 = 0x02C;
+constexpr uint32_t REG_BASE_LO = 0x030;
+constexpr uint32_t REG_BASE_HI = 0x034;
+constexpr uint32_t REG_IMEM_ADDR = 0x038;
+constexpr uint32_t REG_IMEM_DATA = 0x03C;
+constexpr uint32_t REG_IMEM_WE = 0x040;
+constexpr uint32_t REG_STATUS = 0x044;
+constexpr uint32_t REG_SHAPE = 0x048;
+constexpr uint32_t REG_DBG_ADDR = 0x04C;
+constexpr uint32_t REG_DBG_SEL = 0x050;
+constexpr uint32_t REG_DBG_DATA = 0x054;
+
 /// 核的形状：warp 大小、warp 数、一次启动的 block 容量、block 数容量
 /// （来自 `SK_core.shape_o`）。
 struct Shape {
@@ -151,10 +175,12 @@ struct Options {
     std::string state;
     std::string wave;
     long max_cycles = 200000;
-    long bdim = 0;              // 0 = 用满容量
+    long bdim = -1;             // < 0 = 用满容量（0 是合法的"非法值"，要能原样传给硬件）
+    long grid = 1;              // block 数（多 block 串行跑）
     long nwarp = 0;             // 0 = 报硬件容量
     long axi_rd_latency = 2;
     long axi_wr_latency = 2;
+    uint64_t gmem_base = 0;      // 设备地址基址（0 = 用核内偏移当绝对地址）
     bool trace = false;
     bool print_shape = false;
 };
@@ -255,6 +281,9 @@ bool parse_args(int argc, char** argv, Options& opt) {
         } else if (arg == "--bdim") {
             if (!need(1)) return false;
             opt.bdim = strtol(argv[++i], nullptr, 0);
+        } else if (arg == "--grid") {
+            if (!need(1)) return false;
+            opt.grid = strtol(argv[++i], nullptr, 0);
         } else if (arg == "--nwarp") {
             if (!need(1)) return false;
             opt.nwarp = strtol(argv[++i], nullptr, 0);
@@ -264,6 +293,9 @@ bool parse_args(int argc, char** argv, Options& opt) {
         } else if (arg == "--axi-wr-latency") {
             if (!need(1)) return false;
             opt.axi_wr_latency = strtol(argv[++i], nullptr, 0);
+        } else if (arg == "--gmem-base") {
+            if (!need(1)) return false;
+            opt.gmem_base = strtoull(argv[++i], nullptr, 0);
         } else if (arg == "--trace") {
             opt.trace = true;
         } else if (arg == "--print-shape") {
@@ -416,16 +448,13 @@ int main(int argc, char** argv) {
     context.commandArgs(argc, argv);
     Vtb_top* dut = new Vtb_top{&context};
 
-    // 复位状态 + 特殊寄存器
+    // 复位状态：主机侧只驱动 AXI-Lite 命令口和内存的主机口
     dut->clk = 0;
     dut->aresetn = 0;
-    dut->start_i = 0;
-    dut->imem_we_i = 0;
-    dut->imem_addr_i = 0;
-    dut->imem_wdata_i = 0;
-    dut->dbg_addr_i = 0;
-    dut->dbg_wid_i = 0;
-    dut->dbg_lane_i = 0;
+    dut->cmd_valid_i = 0;
+    dut->cmd_wr_i = 0;
+    dut->cmd_addr_i = 0;
+    dut->cmd_wdata_i = 0;
     dut->smem_ld_we_i = 0;
     dut->smem_ld_addr_i = 0;
     dut->smem_ld_wdata_i = 0;
@@ -444,16 +473,80 @@ int main(int argc, char** argv) {
     };
     dut->rd_lat_i = clamp_latency(opt.axi_rd_latency);
     dut->wr_lat_i = clamp_latency(opt.axi_wr_latency);
-    for (int i = 0; i < 16; i++) {
-        dut->sreg_i[i] = 0;
-    }
+    // 从机按这个基址解码（等于主机写进 GMEM_BASE 的值）；0 = 直接用偏移
+    dut->addr_base_i = opt.gmem_base;
     dut->eval();
 
+    // 波形：只有 trace 版模型（make tb-trace）才有，每个半周期 dump 一次
+#if VM_TRACE
+    std::unique_ptr<VerilatedFstC> fst;
+    if (!opt.wave.empty()) {
+        Verilated::traceEverOn(true);
+        fst = std::make_unique<VerilatedFstC>();
+        dut->trace(fst.get(), 99);
+        fst->open(opt.wave.c_str());
+    }
+    vluint64_t wave_time = 0;
+    auto dump_wave = [&]() {
+        if (fst) {
+            fst->dump(wave_time);
+        }
+        wave_time++;
+    };
+#else
+    auto dump_wave = []() {};
+#endif
+
+    // 时钟和主机访问。AXI-Lite 的每一笔读写都要几个时钟，所以单独记 tick 数，
+    // 报出来的 cycles 是"从写 CTRL.start 到看见 done"的时钟数（含轮询开销）。
+    long ticks = 0;
+    auto tick = [&]() {
+        dut->clk = 0;
+        dut->eval();
+        dump_wave();
+        dut->clk = 1;
+        dut->eval();
+        dump_wave();
+        ticks++;
+    };
+    auto axil_write = [&](uint32_t addr, uint32_t data) {
+        while (!dut->cmd_ready_o) tick();
+        dut->cmd_valid_i = 1;
+        dut->cmd_wr_i = 1;
+        dut->cmd_addr_i = addr & 0xfffu;
+        dut->cmd_wdata_i = data;
+        tick();
+        dut->cmd_valid_i = 0;
+        while (!dut->rsp_valid_o) tick();
+        if (dut->rsp_error_o) {
+            std::cerr << "AXI-Lite 写 0x" << std::hex << addr << " 回了非 OKAY\n";
+        }
+        tick();
+    };
+    auto axil_read = [&](uint32_t addr) -> uint32_t {
+        while (!dut->cmd_ready_o) tick();
+        dut->cmd_valid_i = 1;
+        dut->cmd_wr_i = 0;
+        dut->cmd_addr_i = addr & 0xfffu;
+        dut->cmd_wdata_i = 0;
+        tick();
+        dut->cmd_valid_i = 0;
+        while (!dut->rsp_valid_o) tick();
+        uint32_t value = dut->rsp_rdata_o;
+        tick();
+        return value;
+    };
+
+    for (int i = 0; i < 4; i++) tick();
+    dut->aresetn = 1;
+    for (int i = 0; i < 2; i++) tick();
+
     Shape shape;
-    shape.warpsz = dut->shape_o & 0xffu;
-    shape.nwarp = (dut->shape_o >> 8) & 0xffu;
+    uint32_t shape_reg = axil_read(REG_SHAPE);
+    shape.warpsz = shape_reg & 0xffu;
+    shape.nwarp = (shape_reg >> 8) & 0xffu;
     shape.max_block_dim = shape.warpsz * shape.nwarp;
-    shape.max_grid = 1;                   // P3：一个 block（grid > 1 在 P6）
+    shape.max_grid = 0xFFFFu;    // GRID_DIM 是 16 位寄存器，block 之间串行
     if (shape.warpsz == 0 || shape.nwarp == 0) {
         std::cerr << "核报了 warpsz = 0 或者 nwarp = 0\n";
         return 2;
@@ -465,15 +558,26 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // WARPSZ / NWARP 是硬件容量，BLOCK_DIM 默认用满（也可以 --bdim 给小一点的 block），
-    // GRID = 1、BID = 0；TID/LANEID/WID 由核按 warp 和 lane 算
-    uint32_t bdim = opt.bdim > 0 ? (uint32_t)opt.bdim : shape.max_block_dim;
-    dut->sreg_i[SREG_WARPSZ] = shape.warpsz;
-    dut->sreg_i[SREG_NWARP] = opt.nwarp > 0 ? (uint32_t)opt.nwarp : shape.nwarp;
-    dut->sreg_i[SREG_BLOCK_DIM] = bdim;
-    dut->sreg_i[SREG_GRID] = 1;
+    // BLOCK_DIM 默认用满容量（也可以 --bdim 给小一点的 block），GRID 默认 1；
+    // WARPSZ/NWARP/BID 由硬件按启动参数算
+    uint32_t bdim = opt.bdim >= 0 ? (uint32_t)opt.bdim : shape.max_block_dim;
+
+    // 参数走 AXI-Lite 控制寄存器（和板上一样）
+    axil_write(REG_GRID, opt.grid > 0 ? (uint32_t)opt.grid : 1u);
+    axil_write(REG_BLOCK_DIM, bdim);
+    // 设备地址基址：上板时这里写 BO 的地址（可能 > 4 GB），核里的指针是 32 位偏移
+    axil_write(REG_BASE_LO, (uint32_t)(opt.gmem_base & 0xFFFFFFFFull));
+    axil_write(REG_BASE_HI, (uint32_t)(opt.gmem_base >> 32));
     for (const SregValue& sreg : opt.sregs) {
-        dut->sreg_i[sreg.index] = sreg.value;
+        switch (sreg.index) {
+            case SREG_PTR_A: axil_write(REG_PTR_A, sreg.value); break;
+            case SREG_PTR_B: axil_write(REG_PTR_B, sreg.value); break;
+            case SREG_PTR_C: axil_write(REG_PTR_C, sreg.value); break;
+            case SREG_ARG0: axil_write(REG_ARG0, sreg.value); break;
+            case SREG_ARG1: axil_write(REG_ARG1, sreg.value); break;
+            case SREG_ARG2: axil_write(REG_ARG2, sreg.value); break;
+            default: break;
+        }
     }
 
     std::vector<uint32_t> image;
@@ -516,64 +620,17 @@ int main(int argc, char** argv) {
         }
     }
 
-    // 波形：只有 trace 版模型（make tb-trace）才有，每个半周期 dump 一次
-#if VM_TRACE
-    std::unique_ptr<VerilatedFstC> fst;
-    if (!opt.wave.empty()) {
-        Verilated::traceEverOn(true);
-        fst = std::make_unique<VerilatedFstC>();
-        dut->trace(fst.get(), 99);
-        fst->open(opt.wave.c_str());
-    }
-    vluint64_t wave_time = 0;
-    auto dump_wave = [&]() {
-        if (fst) {
-            fst->dump(wave_time);
-        }
-        wave_time++;
-    };
-#else
-    auto dump_wave = []() {};
-#endif
-
-    auto low_phase = [&]() {
-        dut->clk = 0;
-        dut->eval();
-        dump_wave();
-    };
-    auto clock_edge = [&]() {
-        dut->clk = 1;
-        dut->eval();
-        dump_wave();
-    };
-    auto tick = [&]() {
-        low_phase();
-        clock_edge();
-    };
-    auto dbg = [&](uint8_t addr) -> uint32_t {
-        dut->dbg_addr_i = addr;
-        dut->eval();
-        return dut->dbg_data_o;
-    };
-
-    // 复位
-    for (int i = 0; i < 4; i++) {
-        tick();
-    }
-
-    // 装载 IMEM 镜像
-    dut->imem_we_i = 1;
+    // 装载 IMEM 镜像：走控制寄存器（地址 → 数据 → 写脉冲）
     for (size_t i = 0; i < image.size(); i++) {
-        dut->imem_addr_i = (uint32_t)i;
-        dut->imem_wdata_i = image[i];
-        tick();
+        axil_write(REG_IMEM_ADDR, (uint32_t)i);
+        axil_write(REG_IMEM_DATA, image[i]);
+        axil_write(REG_IMEM_WE, 1);
     }
-    dut->imem_we_i = 0;
 
     // shared 初态：核的主机口（写当拍生效，tick 一拍）
     for (const auto& [addr, word] : smem_init) {
         dut->smem_ld_we_i = 1;
-        dut->smem_ld_addr_i = (addr & 0x7FFFu) >> 2;
+        dut->smem_ld_addr_i = (addr & 0x1FFFu) >> 2;
         dut->smem_ld_wdata_i = word;
         tick();
         dut->smem_ld_we_i = 0;
@@ -587,47 +644,57 @@ int main(int argc, char** argv) {
         tick();
         dut->host_we_i = 0;
     }
-    dut->aresetn = 1;
 
-    // 启动
-    dut->start_i = 1;
-    low_phase();
-    clock_edge();
-    dut->start_i = 0;
+    // 调试扫描口：选 (warp, lane) + 扫描地址，再读数据
+    uint32_t dbg_wid = 0, dbg_lane = 0;
+    uint32_t lane_w = 0;
+    while ((1u << lane_w) < shape.warpsz) lane_w++;
+    auto dbg = [&](uint8_t addr) -> uint32_t {
+        axil_write(REG_DBG_SEL, (dbg_wid << lane_w) | dbg_lane);
+        axil_write(REG_DBG_ADDR, addr);
+        return axil_read(REG_DBG_DATA);
+    };
 
+    // 启动：写 CTRL.start，然后轮询 CTRL.done
+    long cycles_start = ticks;
+    axil_write(REG_CTRL, 1);
     long cycles = 0;
-    while (!dut->done_o && cycles < opt.max_cycles) {
-        low_phase();
-        if (opt.trace && (dbg(DBG_RUN) & 1u)) {   // bit0 = 在跑
+    while (cycles < opt.max_cycles) {
+        uint32_t ctrl = axil_read(REG_CTRL);
+        cycles = ticks - cycles_start;
+        if (ctrl & 2u) break;                     // bit1 = done
+        // --trace：每轮轮询顺手看一眼执行级。AXI-Lite 读要几个时钟，所以这是
+        // 抽样而不是逐指令（要逐指令看波形用 --dump-wave）
+        if (opt.trace && (dbg(DBG_RUN) & 1u)) {
             uint32_t s4 = dbg(DBG_S4_WID);
-            uint32_t wid = s4 & 0x3u;             // {valid, wid}：低 2 位是 wid
-            uint32_t pc = dbg(DBG_PC_S4);
-            uint32_t insn = dbg(DBG_INSN);
-            if (s4 & 4u) {                   // bit2 = 这一级真的有指令
-                dut->dbg_wid_i = wid;        // 顺便看一眼这条 warp 现在的 M
+            if (s4 & 4u) {                       // bit2 = 这一级真的有指令
+                uint32_t wid  = s4 & 3u;
+                uint32_t pc   = dbg(DBG_PC_S4);
+                uint32_t insn = dbg(DBG_INSN);
+                uint32_t keep_wid = dbg_wid, keep_lane = dbg_lane;
+                dbg_wid = wid;
+                dbg_lane = 0;
                 uint32_t m = dbg(DBG_M);
-                dut->dbg_lane_i = 0;
-                uint32_t pred = dbg(DBG_PRED);
-                uint32_t r25 = dbg(25);
-                printf("cyc=%-4ld w%u pc=%04x insn=%08x m=%x p=%x r25=%x\n", cycles, wid, pc,
-                       insn, m, pred, r25);
-                dut->dbg_wid_i = 0;
+                dbg_wid = keep_wid;
+                dbg_lane = keep_lane;
+                printf("cyc=%-5ld w%u pc=%04x insn=%08x m=%x\n", cycles, wid, pc, insn, m);
             }
         }
-        clock_edge();
-        cycles++;
     }
 
     // 按 warp × lane 扫一遍：GPR 和谓词都是每 (warp, lane) 一份，M 是每 warp N 位
+    uint32_t dump_warps = (opt.nwarp > 0) ? (uint32_t)opt.nwarp : shape.nwarp;
+    if (dump_warps > shape.nwarp) dump_warps = shape.nwarp;
     std::vector<WarpState> warps;
-    for (uint32_t wid = 0; wid < shape.nwarp; wid++) {
+    for (uint32_t wid = 0; wid < dump_warps; wid++) {
         WarpState warp;
         warp.wid = wid;
-        dut->dbg_wid_i = wid;
+        dbg_wid = wid;
+        dbg_lane = 0;
         warp.pc = dbg(DBG_PC_WARP);
         warp.m = dbg(DBG_M);
         for (uint32_t lane = 0; lane < shape.warpsz; lane++) {
-            dut->dbg_lane_i = lane;
+            dbg_lane = lane;
             std::vector<uint32_t> gpr;
             for (int i = 0; i < NUM_GPR; i++) {
                 gpr.push_back(dbg((uint8_t)i));
@@ -637,8 +704,8 @@ int main(int argc, char** argv) {
         }
         warps.push_back(warp);
     }
-    dut->dbg_wid_i = 0;
-    dut->dbg_lane_i = 0;
+    dbg_wid = 0;
+    dbg_lane = 0;
     uint32_t perf[NUM_PERF] = {};
     for (int i = 0; i < NUM_PERF; i++) {
         perf[i] = dbg((uint8_t)(DBG_PERF + i));
@@ -647,7 +714,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < NUM_CLASS; i++) {
         class_cnt[i] = dbg((uint8_t)(DBG_CLASS + i));
     }
-    uint32_t status = dbg(DBG_STATUS);
+    uint32_t status = axil_read(REG_STATUS);
     Trap trap;
     trap.valid = dbg(DBG_TRAP_VALID) != 0;
     trap.wid = dbg(DBG_TRAP_WID);
@@ -662,7 +729,7 @@ int main(int argc, char** argv) {
             for (uint32_t offset = 0; offset < window.words; offset++) {
                 uint32_t addr = window.addr + offset * 4;
                 if (window.smem) {
-                    dut->smem_rd_addr_i = (addr & 0x7FFFu) >> 2;
+                    dut->smem_rd_addr_i = (addr & 0x1FFFu) >> 2;
                     dut->smem_rd_en_i = 1;
                     tick();
                     words.push_back(dut->smem_rd_data_o);
@@ -680,7 +747,7 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    if (!dut->done_o) {
+    if (cycles >= opt.max_cycles) {
         std::cerr << opt.image << ": " << cycles << " 拍还没结束（status=" << status << "）\n";
         return 1;
     }

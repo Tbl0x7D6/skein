@@ -197,6 +197,7 @@ impl Machine {
     fn launch_error(&self) -> Option<Status> {
         let capacity = self.nwarp * self.warpsz;
         let bad = self.warpsz == 0
+            || self.grid == 0
             || self.block_dim == 0
             || self.block_dim > capacity
             || self.block_dim % self.warpsz != 0;

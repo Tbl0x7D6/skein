@@ -84,15 +84,29 @@ package SK_pkg;
     localparam logic [3:0] SK_VOTE_ANY = 4'd0, SK_VOTE_ALL = 4'd1;
 
     /// 特殊寄存器编号：完整清单在 tools/src/isa.rs 的 Sreg（编号的唯一来源，两个文件
-    /// 必须同码）。RTL 只列自己译码时要用的几个——其余编号（PTR_*/ARG* 等）是主机写、
-    /// 由 `sreg_i` 直接读出来的，核不需要知道它们叫什么。
+    /// 必须同码）。核只用到其中几个，但主机接口（SK_ctrl）要按名字填整个数组，
+    /// 所以这里列全。
     /// 单个编号是数组下标（4 位），`SK_SREG_MAX` 要和译码里的 5 位 `ra` 比，所以是 5 位。
+    /// 每个顶层只用到其中一部分（`SK_core` 认 TID/WARPSZ/BLOCK_DIM…，`SK_ctrl` 填整张
+    /// 表），单独 lint `SK_core` 时 Verilator 会抱怨没被用到的几个，这里显式关掉。
+    /* verilator lint_off UNUSEDPARAM */
     localparam logic [3:0] SK_SREG_TID       = 4'd0,
                            SK_SREG_LANEID    = 4'd1,
                            SK_SREG_WID       = 4'd2,
                            SK_SREG_WARPSZ    = 4'd3,
+                           SK_SREG_NWARP     = 4'd4,
+                           SK_SREG_GRID      = 4'd5,
+                           SK_SREG_PTR_A     = 4'd6,
+                           SK_SREG_PTR_B     = 4'd7,
+                           SK_SREG_PTR_C     = 4'd8,
+                           SK_SREG_ARG0      = 4'd9,
+                           SK_SREG_ARG1      = 4'd10,
+                           SK_SREG_ARG2      = 4'd11,
+                           SK_SREG_STATUS    = 4'd12,
+                           SK_SREG_BID       = 4'd13,
                            SK_SREG_BLOCK_DIM = 4'd14;
     localparam logic [4:0] SK_SREG_MAX       = 5'd14;
+    /* verilator lint_on UNUSEDPARAM */
 
     /// 调度器里一个 warp 的状态。`BAR` 是"到了屏障在等"，`DONE` 是"EXIT 了或者
     /// 这次 block 没让它起来"。见 docs/design.md §7。

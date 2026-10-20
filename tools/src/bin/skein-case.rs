@@ -406,7 +406,7 @@ fn run(case: &Case, args: &Args, shape: Option<&RtlShape>) -> Result<Outcome, Ve
             format!(
                 "issued={} retired={} replay={} no_issue={} no_warp={} lsu_busy={}\n    \
                  lds={} sts={} lds_replay={} l1(hit/miss/wb)={}/{}/{} wr={}/{}\n    \
-                 axi(rd/wr txn)={}/{} beats={}/{} bytes={} stall={}",
+                 axi(rd/wr txn)={}/{} beats={}/{} core_bytes={} bus_bytes={} stall={}",
                 snapshot.perf.issued,
                 snapshot.perf.retired,
                 snapshot.perf.replay,
@@ -426,6 +426,8 @@ fn run(case: &Case, args: &Args, shape: Option<&RtlShape>) -> Result<Outcome, Ve
                 snapshot.perf.axi_rd_beats,
                 snapshot.perf.axi_wr_beats,
                 (snapshot.perf.axi_rd_beats + snapshot.perf.axi_wr_beats) * 8,
+                // 512-bit 主口：一笔事务搬一整行 64 B（见 design.md §8/§12.11）
+                (snapshot.perf.axi_rd_txn + snapshot.perf.axi_wr_txn) * 64,
                 snapshot.perf.axi_stall,
             )
         });
